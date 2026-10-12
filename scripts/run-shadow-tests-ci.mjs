@@ -62,9 +62,9 @@ export function runShadowTests({
       stderr(`[sol-test] Failed to spawn compiler: ${error.message}\n`);
       resolve({ code: 1, reason: 'spawn-failed' });
     });
-    child.on('close', (code, signal) => {
-      clearTimeout(timeout);
-      // Best effort: reap any descendant left in the owned process group.
+    // Reap descendants as soon as the compiler leader exits: a JVM left in the
+    // owned process group can hold the inherited pipes open and delay `close`.
+    child.on('exit', () => {
       if (grouped && child.pid) {
         try {
           process.kill(-child.pid, 'SIGKILL');
@@ -72,6 +72,10 @@ export function runShadowTests({
           if (error.code !== 'ESRCH') stderr(`[sol-test] ${error.message}\n`);
         }
       }
+    });
+    // `close` still collects the final output; the verdict uses the leader's status.
+    child.on('close', (code, signal) => {
+      clearTimeout(timeout);
       const result = resultOf(output, code, signal, timedOut);
       if (result.code !== 0) stderr(`[sol-test] Rejected test execution: ${result.reason}\n`);
       resolve(result);

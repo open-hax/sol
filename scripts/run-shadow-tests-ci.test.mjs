@@ -74,3 +74,20 @@ test('missing executable and timed out child fail', async () => {
   assert.notEqual(result.code, 0);
   assert.equal(result.reason, 'timeout');
 });
+
+test('a descendant holding stdio open is reaped when the compiler exits', async () => {
+  const leader = [
+    "const { spawn } = require('node:child_process');",
+    "spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000);'], { stdio: 'inherit' }).unref();",
+    `process.stdout.write(${JSON.stringify(passing)}, () => process.exit(0));`,
+  ].join(' ');
+  const result = await runShadowTests({
+    command: process.execPath,
+    args: ['-e', leader],
+    timeoutMs: 5_000,
+    stdout: quiet,
+    stderr: quiet,
+  });
+  assert.equal(result.reason, 'completed-nonempty-suite');
+  assert.equal(result.code, 0);
+});
