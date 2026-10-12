@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const shadowCli = fileURLToPath(new URL('../node_modules/shadow-cljs/cli/runner.js', import.meta.url));
@@ -19,6 +19,26 @@ function resultOf(output, code, signal, timedOut) {
     return { code: 1, reason: 'compiler-warnings' };
   }
   return { code: 0, reason: 'completed-nonempty-suite' };
+}
+
+
+/** Kill the spawned compiler and any descendants it still owns. */
+function killCompilerTree(pid, grouped, stderr) {
+  if (!pid) return;
+  try {
+    if (grouped) {
+      process.kill(-pid, 'SIGKILL');
+      return;
+    }
+    if (process.platform === 'win32') {
+      // No POSIX process groups on Windows; taskkill /T ends the tree.
+      spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore' });
+      return;
+    }
+    process.kill(pid, 'SIGKILL');
+  } catch (error) {
+    if (error.code !== 'ESRCH') stderr(`[sol-test] ${error.message}\n`);
+  }
 }
 
 /** Run the local compiler with a bounded lifetime; return its verified verdict. */
@@ -44,12 +64,7 @@ export function runShadowTests({
     const timeout = setTimeout(() => {
       timedOut = true;
       // Kill the owned compiler process group, including its JVM, on timeout.
-      try {
-        if (grouped && child.pid) process.kill(-child.pid, 'SIGKILL');
-        else child.kill('SIGKILL');
-      } catch (error) {
-        if (error.code !== 'ESRCH') stderr(`[sol-test] ${error.message}\n`);
-      }
+      killCompilerTree(child.pid, grouped, stderr);
     }, timeoutMs);
     const consume = (chunk, write) => {
       output += chunk.toString();
@@ -65,13 +80,7 @@ export function runShadowTests({
     // Reap descendants as soon as the compiler leader exits: a JVM left in the
     // owned process group can hold the inherited pipes open and delay `close`.
     child.on('exit', () => {
-      if (grouped && child.pid) {
-        try {
-          process.kill(-child.pid, 'SIGKILL');
-        } catch (error) {
-          if (error.code !== 'ESRCH') stderr(`[sol-test] ${error.message}\n`);
-        }
-      }
+      killCompilerTree(child.pid, grouped, stderr);
     });
     // `close` still collects the final output; the verdict uses the leader's status.
     child.on('close', (code, signal) => {
