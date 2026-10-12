@@ -5,7 +5,8 @@
    - shadow-cljs calls open-hax.sol.entrypoint/init.
    - Node/npm modules are required by the CLJS namespaces that consume them.
    - This namespace orchestrates startup and manages the HTTP lifecycle."
-  (:require [open-hax.sol.contract-runtime-deps :as contract-runtime-deps]
+  (:require [open-hax.sol.extern.console :as xconsole]
+            [open-hax.sol.contract-runtime-deps :as contract-runtime-deps]
             [open-hax.sol.infra.agent.run-state :as run-state]
             [open-hax.sol.infra.agent.session-store :as session-store]
             [open-hax.sol.infra.agent.clio-store :as clio-store]
@@ -143,9 +144,12 @@
           ;; server; restore service with the previous, still-remembered config.
           (try
             (await (start-http! runtime previous-config))
-            (.warn js/console "[sol-hot-reload] after-load: restored HTTP server with previous config")
+            ;; Keep the lifecycle context in step with the server actually running,
+            ;; so the next reload's previous-config is the working one.
+            (lifecycle/remember-context! runtime previous-config nil false)
+            (xconsole/warn! "[sol-hot-reload] after-load: restored HTTP server with previous config")
             (catch :default restore-err
-              (.error js/console "[sol-hot-reload] failed to restore HTTP server with previous config" restore-err))))
+              (xconsole/error! "[sol-hot-reload] failed to restore HTTP server with previous config" restore-err))))
         (finally (done)))
       (do
         (.warn js/console "[sol-hot-reload] no lifecycle context; skipping HTTP restart")

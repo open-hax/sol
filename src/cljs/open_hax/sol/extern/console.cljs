@@ -6,3 +6,8 @@
   "Write a structured error line to the host console."
   [message data]
   (.error js/console message data))
+
+(defn warn!
+  "Write a warning line to the host console."
+  [message]
+  (.warn js/console message))
