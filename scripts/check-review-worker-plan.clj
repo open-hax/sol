@@ -64,6 +64,8 @@
         (require-check! (and (= 'ns (first ns-form))
                              (= (symbol namespace) (second ns-form)))
                         (str "Namespace drift: " path))
+        (require-check! (and (string? anchor) (not (str/blank? anchor)))
+                        (str "Blank integration anchor: " path))
         (require-check! (str/includes? source anchor) (str "Anchor drift: " path))))
     {:proposal (:proposal/id plan) :status :proposed
      :dependency-pins (count (:dependencies plan)) :integration-files (count points)

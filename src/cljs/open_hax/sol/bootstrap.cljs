@@ -138,7 +138,14 @@
                 #js {:pid (.-pid js/process)
                      :uptimeMs (process-uptime-ms)}))
         (catch :default err
-          (.error js/console "[sol-hot-reload] failed to restart HTTP server" err))
+          (.error js/console "[sol-hot-reload] failed to restart HTTP server" err)
+          ;; Reconfiguration (or the restart) failed after before-load closed the
+          ;; server; restore service with the previous, still-remembered config.
+          (try
+            (await (start-http! runtime previous-config))
+            (.warn js/console "[sol-hot-reload] after-load: restored HTTP server with previous config")
+            (catch :default restore-err
+              (.error js/console "[sol-hot-reload] failed to restore HTTP server with previous config" restore-err))))
         (finally (done)))
       (do
         (.warn js/console "[sol-hot-reload] no lifecycle context; skipping HTTP restart")

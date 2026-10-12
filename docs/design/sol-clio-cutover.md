@@ -17,7 +17,7 @@ ledger law, UUID/hash law, causal canonicalizer or Rheos implementation is copie
 `law/lifecycle_catalog.cljc` defines only Sol lifecycle data. The six existing
 lifecycle names correspond to `:sol.run/started`, `:sol.run/failed`,
 `:sol.run/completed`, `:sol.turn/started`, `:sol.turn/failed` and
-`:sol.turn/completed`. Each episode is one Clio stream starting at sequence1.
+`:sol.turn/completed`. Each episode is one Clio stream starting at sequence 1.
 Run/session/turn/episode IDs, transport attribution, supplied principal binding,
 resource revision, conversation and payload facts are carried in `:event/data`.
 Actor attribution is not a newly authenticated principal. Axxium and Katamorph

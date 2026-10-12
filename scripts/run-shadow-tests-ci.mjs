@@ -64,6 +64,14 @@ export function runShadowTests({
     });
     child.on('close', (code, signal) => {
       clearTimeout(timeout);
+      // Best effort: reap any descendant left in the owned process group.
+      if (grouped && child.pid) {
+        try {
+          process.kill(-child.pid, 'SIGKILL');
+        } catch (error) {
+          if (error.code !== 'ESRCH') stderr(`[sol-test] ${error.message}\n`);
+        }
+      }
       const result = resultOf(output, code, signal, timedOut);
       if (result.code !== 0) stderr(`[sol-test] Rejected test execution: ${result.reason}\n`);
       resolve(result);
