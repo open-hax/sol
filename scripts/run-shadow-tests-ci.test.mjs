@@ -91,3 +91,27 @@ test('a descendant holding stdio open is reaped when the compiler exits', async 
   assert.equal(result.reason, 'completed-nonempty-suite');
   assert.equal(result.code, 0);
 });
+
+test('a pipe holder outside the reaped tree fails instead of hanging', { timeout: 15_000 }, async () => {
+  // The grandchild starts its own process group, so killing the compiler's
+  // group cannot reach it, as with a Windows orphan that escaped taskkill.
+  const leader = [
+    "const { spawn } = require('node:child_process');",
+    "const g = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 20000);'], { stdio: 'inherit', detached: true });",
+    "process.stderr.write('GRANDCHILD ' + g.pid + '\\n'); g.unref();",
+    `process.stdout.write(${JSON.stringify(passing)}, () => process.exit(0));`,
+  ].join(' ');
+  let captured = '';
+  const result = await runShadowTests({
+    command: process.execPath,
+    args: ['-e', leader],
+    timeoutMs: 60_000,
+    closeGraceMs: 300,
+    stdout: quiet,
+    stderr: (chunk) => { captured += chunk.toString(); },
+  });
+  const grandchild = Number(/GRANDCHILD (\d+)/.exec(captured)?.[1]);
+  if (grandchild) try { process.kill(grandchild, 'SIGKILL'); } catch {}
+  assert.equal(result.code, 1);
+  assert.equal(result.reason, 'descendant-held-pipes');
+});
