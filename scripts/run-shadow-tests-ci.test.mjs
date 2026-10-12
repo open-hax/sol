@@ -92,7 +92,12 @@ test('a descendant holding stdio open is reaped when the compiler exits', async 
   assert.equal(result.code, 0);
 });
 
-test('a pipe holder outside the reaped tree fails instead of hanging', { timeout: 15_000 }, async () => {
+test('a pipe holder outside the reaped tree fails instead of hanging', {
+  timeout: 15_000,
+  // POSIX process-group behavior only: on Windows the detached grandchild is
+  // still found by ParentProcessId and reaped, which the previous test covers.
+  skip: process.platform === 'win32',
+}, async () => {
   // The grandchild starts its own process group, so killing the compiler's
   // group cannot reach it, as with a Windows orphan that escaped taskkill.
   const leader = [
