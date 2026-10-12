@@ -154,8 +154,8 @@ Historical qualification above remains evidence of those earlier revisions.
 | Actual portable catalog on JVM | Loads successfully; six upstream-composed catalog leaves. |
 | Server / native ESM builds | 197 / 95 files; zero warnings. |
 | Separate production-only install | 154 packages; authoritative npm lock unchanged. |
-| Production ESM real-file probe | Two events, identical lost-ack retry, sequences1/2, explicit cause and complete reopen/replay. |
-| Production localhost startup | Default and Clio-enabled modes both health200 and clean SIGTERM exit0. |
+| Production ESM real-file probe | Two events, identical lost-ack retry, sequences 1/2, explicit cause and complete reopen/replay. |
+| Production localhost startup | Default and Clio-enabled modes both health 200 and clean SIGTERM exit 0. |
 | Workflow/diff syntax | actionlint and git diff check pass. |
 
 The final production probes were repeated after the payload/hot-reload fixes.

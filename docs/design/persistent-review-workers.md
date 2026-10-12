@@ -1,7 +1,10 @@
 # Persistent MiMo and Kimi review workers: phase one
 
-Status: proposed, not activated. Source inspected at Sol
-`1276955c86ff46936cd1ce7d81fbc790f7068e1e`.
+Status: proposed, not activated. Source first inspected at Sol
+`1276955c86ff46936cd1ce7d81fbc790f7068e1e`. The integration inventory in
+`persistent-review-workers.edn` names later files (for example
+`infra/agent/clio_store.cljs`), so it is validated against the current tree by
+`scripts/check-review-worker-plan.clj`, not against a single pinned revision.
 Parent: [Foresight PR #122](https://github.com/open-hax/foresight/pull/122),
 [story 330aa63f-f697-5bd6-9fc0-3f19fbea2be4](https://github.com/open-hax/foresight/blob/plan/fork-dev-origins/docs/agile/kanban/330aa63f-f697-5bd6-9fc0-3f19fbea2be4.md).
 

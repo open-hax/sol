@@ -5,6 +5,7 @@
    session state, provider execution, and realtime broadcasts. This namespace
    adds only the cross-runtime operational envelope owned by Clio."
   (:require [open-hax.sol.extern.agent-turn-node :as xturn-node]
+            [open-hax.sol.extern.console :as xconsole]
             [open-hax.sol.infra.agent.episode-ledger :as episode-ledger]
             [open-hax.sol.infra.agent.turn :as turn]))
 
@@ -115,14 +116,12 @@
     (try
       (if-let [report! (:clio/report-error! config)]
         (await (report! failure))
-        (.error js/console
-                "[sol-clio] canonical terminal persistence failed"
-                failure))
+        (xconsole/error! "[sol-clio] canonical terminal persistence failed"
+                         failure))
       (catch :default report-error
-        (.error js/console
-                "[sol-clio] persistence failure reporter failed"
-                (assoc failure
-                       :report/error (error-message report-error)))))
+        (xconsole/error! "[sol-clio] persistence failure reporter failed"
+                         (assoc failure
+                                :report/error (error-message report-error)))))
     failure))
 
 (defn- ^:async emit-completion-lifecycle!
