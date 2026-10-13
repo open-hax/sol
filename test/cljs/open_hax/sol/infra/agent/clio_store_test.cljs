@@ -5,8 +5,8 @@
             [clio.infra.ledger :as ledger]
             [clio.infra.runtime :as runtime]
             [open-hax.sol.clio-native-probe :as probe]
-            [open-hax.sol.domain.node.fs :as node-fs]
             [open-hax.sol.domain.node.path :as path]
+            [open-hax.sol.extern.exclusive-fs :as exclusive-fs]
             [open-hax.sol.infra.agent.clio-store :as store]
             [open-hax.sol.infra.agent.episode-ledger :as episode]
             [open-hax.sol.infra.agent.session-store :as sessions]))
@@ -129,9 +129,9 @@
 (deftest close-failure-after-exclusive-create-rolls-back-the-ledger-test
   (let [root (scratch)
         {:keys [ledger-file schema-directory] :as opts} (options root)
-        original-create node-fs/create-exclusive!]
+        original-create exclusive-fs/create-file!]
     (try
-      (with-redefs [node-fs/create-exclusive!
+      (with-redefs [exclusive-fs/create-file!
                     (fn [p on-created]
                       ;; The exclusive open succeeded; the descriptor close fails.
                       (original-create p on-created)
@@ -149,7 +149,7 @@
         {:keys [ledger-file] :as opts} (options root)
         other "{:written/by \"another attempt\"}\n"]
     (try
-      (with-redefs [node-fs/create-exclusive!
+      (with-redefs [exclusive-fs/create-file!
                     (fn [p _on-created]
                       ;; Another attempt won the race between the fresh-epoch
                       ;; check and the exclusive open.
@@ -158,6 +158,30 @@
         (is (thrown-with-msg? js/Error #"EEXIST"
               (store/open! (assoc opts :initialize? true)))))
       (is (= other (fs/read-text ledger-file)) "the other attempt's ledger is kept")
+      (finally (fs/remove-tree! root)))))
+
+(deftest failed-initialization-keeps-a-schema-directory-another-attempt-claimed-test
+  (let [root (scratch)
+        {:keys [ledger-file schema-directory] :as opts} (options root)
+        original-create exclusive-fs/create-file!
+        other-revision (path/join schema-directory "other.edn")
+        other "{:written/by \"another initializer\"}\n"]
+    (try
+      (with-redefs [exclusive-fs/create-file!
+                    (fn [p on-created]
+                      (original-create p on-created)
+                      ;; A second initializer with its own ledger but the same,
+                      ;; initially absent schema directory materializes schema
+                      ;; history between this attempt's fresh-epoch check and
+                      ;; its schema write.
+                      (fs/ensure-dir! schema-directory)
+                      (fs/write-text! other-revision other))
+                    ledger/canonicalize-files
+                    (fn [& _] (throw (ex-info "canonicalization failed" {})))]
+        (is (thrown? js/Error (store/open! (assoc opts :initialize? true)))))
+      (is (not (fs/exists? ledger-file)) "this attempt's own ledger removed")
+      (is (= other (fs/read-text other-revision))
+          "the schema directory another initializer claimed is kept")
       (finally (fs/remove-tree! root)))))
 
 (deftest ensure-configured-refuses-paths-that-differ-from-the-open-store-test

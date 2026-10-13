@@ -11,12 +11,15 @@ import test from 'node:test';
 const script = new URL('./compile-clean.sh', import.meta.url).pathname;
 const runtimeWorkflow = readFileSync(new URL('../.github/workflows/node22-runtime.yml', import.meta.url), 'utf8');
 
-function run(output, { code = 0, artifact = true, channel = 'stdout', target = 'server' } = {}) {
+function run(output, { code = 0, artifact = true, stale = false, channel = 'stdout', target = 'server' } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'sol-compile-clean-'));
   try {
     const bundle = join(directory, 'bundle.js');
-    if (artifact) writeFileSync(bundle, '// fixture');
-    const payload = `process.${channel}.write(${JSON.stringify(output)}); process.exitCode = ${code};`;
+    // A bundle left by an earlier build; the guard must not accept it.
+    if (stale) writeFileSync(bundle, '// stale fixture');
+    // The fixture build writes the artifact itself, as the real compiler does.
+    const write = artifact ? `require('node:fs').writeFileSync(${JSON.stringify(bundle)}, '// fixture'); ` : '';
+    const payload = `${write}process.${channel}.write(${JSON.stringify(output)}); process.exitCode = ${code};`;
     return spawnSync('/bin/bash', ['--noprofile', '--norc', script, target, bundle, process.execPath, '-e', payload],
       { env: { ...process.env, RUNNER_TEMP: directory }, encoding: 'utf8' });
   } finally {
@@ -32,6 +35,7 @@ for (const [label, output, options] of [
   ['missing completion', 'Compiler exited quietly\n', {}],
   ['wrong completed target', compiled.replace('server', 'clio-native'), {}],
   ['missing artifact', compiled, { artifact: false }],
+  ['stale artifact the build did not write', compiled, { artifact: false, stale: true }],
   ['nonzero child exit after completion', compiled, { code: 7 }],
 ]) {
   test(`reject ${label}`, () => assert.notEqual(run(output, options).status, 0));

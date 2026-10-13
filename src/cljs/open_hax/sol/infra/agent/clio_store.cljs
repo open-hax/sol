@@ -6,8 +6,8 @@
             [clio.infra.ledger :as ledger]
             [clio.infra.runtime :as runtime]
             [clojure.string :as str]
-            [open-hax.sol.domain.node.fs :as node-fs]
             [open-hax.sol.domain.node.path :as path]
+            [open-hax.sol.extern.exclusive-fs :as exclusive-fs]
             [open-hax.sol.law.lifecycle-catalog :as lifecycle]))
 
 (defonce local-revision
@@ -36,7 +36,8 @@
     (when (or (not (string? value)) (str/blank? value))
       (throw (ex-info "Explicit Clio filesystem paths required" {:path/key label}))))
   (let [schema-preexisting? (fs/exists? schema-directory)
-        ledger-created? (atom false)]
+        ledger-created? (atom false)
+        schema-created? (atom false)]
     (try
       (if initialize?
         (do
@@ -47,7 +48,13 @@
           ;; is recorded as soon as the exclusive open succeeds, so a failing
           ;; descriptor close still rolls the new ledger back. An exclusive-open
           ;; failure never claims (or deletes) a file another attempt created.
-          (node-fs/create-exclusive! ledger-file #(reset! ledger-created? true)))
+          (exclusive-fs/create-file! ledger-file #(reset! ledger-created? true))
+          ;; The fresh-epoch check above is not ownership: another initializer
+          ;; may create the same schema directory before this one writes it.
+          ;; Claim it with an exclusive mkdir, so rollback only ever removes a
+          ;; directory this attempt created.
+          (fs/ensure-dir! (path/dirname schema-directory))
+          (exclusive-fs/create-directory! schema-directory #(reset! schema-created? true)))
         (do
           ;; Upstream refuses deleted/misspelled paths instead of inventing history.
           (ledger/read-ledgers [ledger-file])
@@ -59,9 +66,9 @@
         {:runtime runtime :ledger-file ledger-file :schema-directory schema-directory})
       (catch :default error
         (when @ledger-created?
-          (attempt-cleanup! #(fs/delete-if-exists! ledger-file))
-          (when-not schema-preexisting?
-            (attempt-cleanup! #(fs/remove-tree! schema-directory))))
+          (attempt-cleanup! #(fs/delete-if-exists! ledger-file)))
+        (when @schema-created?
+          (attempt-cleanup! #(fs/remove-tree! schema-directory)))
         (throw error)))))
 
 (defn append!
