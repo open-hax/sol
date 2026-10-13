@@ -3,6 +3,7 @@
             [clio.extern.js.fs :as fs]
             [clio.infra.event :as event]
             [clio.infra.ledger :as ledger]
+            [clio.infra.runtime :as runtime]
             [open-hax.sol.clio-native-probe :as probe]
             [open-hax.sol.domain.node.path :as path]
             [open-hax.sol.infra.agent.clio-store :as store]
@@ -104,6 +105,36 @@
         (let [error (await (promise-rejection
                            #(sessions/get-events (sessions/create-edn-session-store root) "test-session")))]
           (is (re-find #"not configured" (.-message error)))))
+      (finally (fs/remove-tree! root)))))
+
+(deftest failed-initialization-rolls-back-only-its-own-artifacts-test
+  (let [root (scratch)
+        {:keys [ledger-file schema-directory] :as opts} (options root)
+        original-open runtime/open]
+    (try
+      (with-redefs [runtime/open (fn [directory _catalog]
+                                   ;; Simulate a partial schema write before failure.
+                                   (fs/ensure-dir! directory)
+                                   (throw (ex-info "schema materialization failed" {})))]
+        (is (thrown-with-msg? cljs.core/ExceptionInfo #"schema materialization failed"
+              (store/open! (assoc opts :initialize? true)))))
+      (is (not (fs/exists? ledger-file)) "partial ledger removed")
+      (is (not (fs/exists? schema-directory)) "schema directory created by the attempt removed")
+      (is (identical? original-open runtime/open))
+      (let [canonical-store (store/open! (assoc opts :initialize? true))]
+        (is (= [] (store/events canonical-store)) "retry still sees a fresh storage epoch"))
+      (finally (fs/remove-tree! root)))))
+
+(deftest failed-reopen-leaves-existing-history-test
+  (let [root (scratch)
+        {:keys [ledger-file schema-directory] :as opts} (options root)]
+    (try
+      (store/open! (assoc opts :initialize? true))
+      (let [ledger-bytes (fs/read-text ledger-file)]
+        (with-redefs [runtime/open (fn [_ _] (throw (ex-info "reopen failed" {})))]
+          (is (thrown-with-msg? cljs.core/ExceptionInfo #"reopen failed" (store/open! opts))))
+        (is (= ledger-bytes (fs/read-text ledger-file)))
+        (is (fs/exists? schema-directory)))
       (finally (fs/remove-tree! root)))))
 
 (deftest ^:async unconfigured-session-append-rejects-test

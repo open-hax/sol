@@ -38,9 +38,9 @@ its local result and separately reports canonical persistence failure through
 `:clio/report-error!`. Such a result does not prove canonical terminal acceptance
 or review eligibility.
 
-Clio's native dependency `fs-ext-extra-prebuilt` is pinned to2.2.9 in the Sol
+Clio's native dependency `fs-ext-extra-prebuilt` is pinned to 2.2.9 in the Sol
 production npm lock. Actual compiled ESM imports and native locks require the
-exact Node22.20.0/npm10.9.3 production install qualification below.
+exact Node 22.20.0/npm 10.9.3 production install qualification below.
 
 ## Explicit opt-in filesystem configuration
 
@@ -84,7 +84,7 @@ schema revision.
 
 | Capability | Observed gap / proper follow-up |
 | --- | --- |
-| Mongo persistence | Clio788cdd has no Mongo adapter/storage protocol. Add transport upstream if required, then consume it; no implicit conversion here. |
+| Mongo persistence | Clio 788cdd has no Mongo adapter/storage protocol. Add transport upstream if required, then consume it; no implicit conversion here. |
 | Durable acknowledgement | Upstream locked append calls `appendFileSync` without `fsync`/`fdatasync`. This slice proves native append acceptance, not power-loss durability. The worker contract still requires upstream proof/capability. |
 | Legacy continuity | No predecessor bridge is exposed. Arbitrary old IDs, envelope versions and Mongo global sequence cannot be treated as Clio UUIDs/per-stream history. Preserve old bytes; admit migration upstream separately. |
 | Lease/fence/restart intent | An inode append lock and process-local pending data are not a worker lease, monotonic fence or restart intent store. Existing worker requirements remain unsatisfied. |
@@ -124,7 +124,7 @@ npm run check:startup
 npm run check:startup -- dist/server.js --clio
 ```
 
-The hosted Node22 workflow retains frozen npm install, anonymous public pinned Git
+The hosted Node 22 workflow retains frozen npm install, anonymous public pinned Git
 dependency preparation, guard/lint, plan checks, actual tests, server build and
 health/SIGTERM checks. Its isolated production stage uses `npm ci --omit=dev`,
 compares the authoritative lockfile, then runs both the compiled Clio ESM probe

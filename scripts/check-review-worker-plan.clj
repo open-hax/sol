@@ -8,26 +8,29 @@
   (when-not valid?
     (throw (ex-info message {}))))
 
-(def expected-integration-paths
-  "Current bounded source inventory, independent of the proposal being checked."
-  #{"src/cljs/open_hax/sol/infra/agent/service.cljs"
-    "src/cljs/open_hax/sol/infra/agent/runner.cljs"
-    "src/cljs/open_hax/sol/infra/agent/provider/turn_processor.cljs"
-    "src/cljs/open_hax/sol/infra/agent/turn_session.cljs"
-    "src/cljs/open_hax/sol/infra/agent/run_state.cljs"
-    "src/cljs/open_hax/sol/infra/agent/session_store.cljs"
-    "src/cljs/open_hax/sol/infra/agent/episode_ledger.cljs"
-    "src/cljs/open_hax/sol/infra/agent/clio_store.cljs"
-    "src/cljs/open_hax/sol/law/lifecycle_catalog.cljc"
-    "src/cljs/open_hax/sol/infra/agent/episode_turn.cljs"
-    "src/cljs/open_hax/sol/shape/episode_event.cljs"
-    "src/cljs/open_hax/sol/law/contract_kinds.cljs"
-    "src/cljs/open_hax/sol/domain/contracts/loader.cljs"
-    "src/cljs/open_hax/sol/bootstrap.cljs"
-    "src/cljs/open_hax/sol/infra/config.cljs"
-    "src/cljs/open_hax/sol/infra/graceful_shutdown.cljs"
-    "src/cljs/open_hax/sol/infra/routes/app.cljs"
-    "src/cljs/open_hax/sol/infra/agent/runtime.cljs"})
+(def expected-integration-anchors
+  "Current bounded source inventory and the integration point each path must
+   name, independent of the proposal being checked."
+  {"src/cljs/open_hax/sol/infra/agent/service.cljs"                  "IAgentService"
+   "src/cljs/open_hax/sol/infra/agent/runner.cljs"                   "spawn-direct!"
+   "src/cljs/open_hax/sol/infra/agent/provider/turn_processor.cljs"  "IAgentProviderAdapter"
+   "src/cljs/open_hax/sol/infra/agent/turn_session.cljs"             "abort!"
+   "src/cljs/open_hax/sol/infra/agent/run_state.cljs"                "IRunStateStore"
+   "src/cljs/open_hax/sol/infra/agent/session_store.cljs"            "ISessionStore"
+   "src/cljs/open_hax/sol/infra/agent/clio_store.cljs"               "open!"
+   "src/cljs/open_hax/sol/law/lifecycle_catalog.cljc"                "schema/event-schema"
+   "src/cljs/open_hax/sol/infra/agent/episode_ledger.cljs"           "configured-appender"
+   "src/cljs/open_hax/sol/infra/agent/episode_turn.cljs"             "send-agent-turn!"
+   "src/cljs/open_hax/sol/shape/episode_event.cljs"                  "principal-binding"
+   "src/cljs/open_hax/sol/law/contract_kinds.cljs"                   "class->kind"
+   "src/cljs/open_hax/sol/domain/contracts/loader.cljs"              "parse-contract-file-records!"
+   "src/cljs/open_hax/sol/bootstrap.cljs"                            "bootstrap!"
+   "src/cljs/open_hax/sol/infra/config.cljs"                         "cfg"
+   "src/cljs/open_hax/sol/infra/graceful_shutdown.cljs"              "begin-shutdown!"
+   "src/cljs/open_hax/sol/infra/routes/app.cljs"                     "api-agent-session-abort!"
+   "src/cljs/open_hax/sol/infra/agent/runtime.cljs"                  "queue-agent-control!"})
+
+(def expected-integration-paths (set (keys expected-integration-anchors)))
 
 (defn declared-git-pins [deps]
   (into {}
@@ -56,7 +59,9 @@
     (require-check! (= expected-integration-paths (set (map :path points)))
                     "Incomplete or extra integration inventory")
     (require-check! (= (count points) (count (set (map :path points)))) "Duplicate source paths")
-    (doseq [{:keys [path namespace anchor]} points]
+    (doseq [{:keys [path namespace anchor gap]} points]
+      (require-check! (and (keyword? gap) (not (str/blank? (name gap))))
+                      (str "Missing integration gap: " path))
       (require-check! (.isFile (io/file path)) (str "Missing integration file: " path))
       (let [source (slurp path)
             ns-form (binding [*read-eval* false]
@@ -66,6 +71,8 @@
                         (str "Namespace drift: " path))
         (require-check! (and (string? anchor) (not (str/blank? anchor)))
                         (str "Blank integration anchor: " path))
+        (require-check! (= (get expected-integration-anchors path) anchor)
+                        (str "Unexpected integration anchor: " path))
         (require-check! (str/includes? source anchor) (str "Anchor drift: " path))))
     {:proposal (:proposal/id plan) :status :proposed
      :dependency-pins (count (:dependencies plan)) :integration-files (count points)

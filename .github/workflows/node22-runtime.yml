@@ -55,8 +55,8 @@ jobs:
       - name: Actual CLJS tests and server compilation
         run: |
           npm test
-          npm run build
-          npm run build:clio-native
+          bash scripts/compile-clean.sh server dist/server.js npm run build
+          bash scripts/compile-clean.sh clio-native target/clio-native/probe.js npm run build:clio-native
       - name: Production dependency startup and SIGTERM
         shell: bash
         run: |

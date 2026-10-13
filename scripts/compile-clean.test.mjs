@@ -1,0 +1,47 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// The Node 22 runtime workflow must apply the evidence workflow's compiler guard
+// to both builds, so a warning or missing artifact cannot leave the job green.
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import test from 'node:test';
+
+const script = new URL('./compile-clean.sh', import.meta.url).pathname;
+const runtimeWorkflow = readFileSync(new URL('../.github/workflows/node22-runtime.yml', import.meta.url), 'utf8');
+
+function run(output, { code = 0, artifact = true, channel = 'stdout', target = 'server' } = {}) {
+  const directory = mkdtempSync(join(tmpdir(), 'sol-compile-clean-'));
+  try {
+    const bundle = join(directory, 'bundle.js');
+    if (artifact) writeFileSync(bundle, '// fixture');
+    const payload = `process.${channel}.write(${JSON.stringify(output)}); process.exitCode = ${code};`;
+    return spawnSync('/bin/bash', ['--noprofile', '--norc', script, target, bundle, process.execPath, '-e', payload],
+      { env: { ...process.env, RUNNER_TEMP: directory }, encoding: 'utf8' });
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+const compiled = '[:server] Build completed. (197 files, 9 compiled, 0 warnings, 1.0s)\n';
+test('complete build with nonempty artifact passes', () => assert.equal(run(compiled).status, 0));
+for (const [label, output, options] of [
+  ['compiler warning', compiled.replace('0 warnings', '1 warnings'), {}],
+  ['stderr warning despite zero completion counter', compiled + 'WARNING: fixture\n', { channel: 'stderr' }],
+  ['missing completion', 'Compiler exited quietly\n', {}],
+  ['wrong completed target', compiled.replace('server', 'clio-native'), {}],
+  ['missing artifact', compiled, { artifact: false }],
+  ['nonzero child exit after completion', compiled, { code: 7 }],
+]) {
+  test(`reject ${label}`, () => assert.notEqual(run(output, options).status, 0));
+}
+
+test('Node 22 runtime workflow guards both builds', () => {
+  assert.match(runtimeWorkflow, /bash scripts\/compile-clean\.sh server dist\/server\.js npm run build\n/);
+  assert.match(runtimeWorkflow,
+    /bash scripts\/compile-clean\.sh clio-native target\/clio-native\/probe\.js npm run build:clio-native\n/);
+  for (const line of runtimeWorkflow.split('\n')) {
+    if (/npm run build/.test(line)) assert.match(line, /scripts\/compile-clean\.sh/, `unguarded build: ${line.trim()}`);
+  }
+});
