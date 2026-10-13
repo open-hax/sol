@@ -5,6 +5,7 @@
             [clio.infra.ledger :as ledger]
             [clio.infra.runtime :as runtime]
             [open-hax.sol.clio-native-probe :as probe]
+            [open-hax.sol.domain.node.fs :as node-fs]
             [open-hax.sol.domain.node.path :as path]
             [open-hax.sol.infra.agent.clio-store :as store]
             [open-hax.sol.infra.agent.episode-ledger :as episode]
@@ -123,6 +124,58 @@
       (is (identical? original-open runtime/open))
       (let [canonical-store (store/open! (assoc opts :initialize? true))]
         (is (= [] (store/events canonical-store)) "retry still sees a fresh storage epoch"))
+      (finally (fs/remove-tree! root)))))
+
+(deftest close-failure-after-exclusive-create-rolls-back-the-ledger-test
+  (let [root (scratch)
+        {:keys [ledger-file schema-directory] :as opts} (options root)
+        original-create node-fs/create-exclusive!]
+    (try
+      (with-redefs [node-fs/create-exclusive!
+                    (fn [p on-created]
+                      ;; The exclusive open succeeded; the descriptor close fails.
+                      (original-create p on-created)
+                      (throw (ex-info "descriptor close failed" {})))]
+        (is (thrown-with-msg? cljs.core/ExceptionInfo #"descriptor close failed"
+              (store/open! (assoc opts :initialize? true)))))
+      (is (not (fs/exists? ledger-file)) "ledger created by this attempt removed")
+      (is (not (fs/exists? schema-directory)))
+      (let [canonical-store (store/open! (assoc opts :initialize? true))]
+        (is (= [] (store/events canonical-store)) "retry still sees a fresh storage epoch"))
+      (finally (fs/remove-tree! root)))))
+
+(deftest exclusive-open-failure-never-deletes-another-attempts-ledger-test
+  (let [root (scratch)
+        {:keys [ledger-file] :as opts} (options root)
+        other "{:written/by \"another attempt\"}\n"]
+    (try
+      (with-redefs [node-fs/create-exclusive!
+                    (fn [p _on-created]
+                      ;; Another attempt won the race between the fresh-epoch
+                      ;; check and the exclusive open.
+                      (fs/write-text! p other)
+                      (throw (js/Error. "EEXIST: file already exists")))]
+        (is (thrown-with-msg? js/Error #"EEXIST"
+              (store/open! (assoc opts :initialize? true)))))
+      (is (= other (fs/read-text ledger-file)) "the other attempt's ledger is kept")
+      (finally (fs/remove-tree! root)))))
+
+(deftest ensure-configured-refuses-paths-that-differ-from-the-open-store-test
+  (let [root (scratch)]
+    (try
+      (let [config (store/configure!
+                    {:clio/ledger-file (:ledger-file (options root))
+                     :clio/schema-directory (:schema-directory (options root))
+                     :clio/initialize? true})]
+        (is (identical? (:clio/store config) (:clio/store (store/ensure-configured! config)))
+            "same paths keep the open store")
+        (is (thrown-with-msg? cljs.core/ExceptionInfo #"full restart"
+              (store/ensure-configured!
+               (assoc config :clio/ledger-file (path/join root "other.edn")))))
+        (is (thrown-with-msg? cljs.core/ExceptionInfo #"full restart"
+              (store/ensure-configured!
+               (assoc config :clio/schema-directory (path/join root "other-schemas")))))
+        (is (not (fs/exists? (path/join root "other.edn")))))
       (finally (fs/remove-tree! root)))))
 
 (deftest failed-reopen-leaves-existing-history-test

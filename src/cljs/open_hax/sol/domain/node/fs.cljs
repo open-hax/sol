@@ -13,6 +13,20 @@
 
 ;; ── Sync ─────────────────────────────────────────────────────────────────
 
+(defn create-exclusive!
+  "Create an empty file with exclusive (`wx`) semantics, as Clio's
+   `create-ledger!` does. `on-created` runs after the exclusive open succeeds
+   and before the descriptor is closed, so the caller owns cleanup even when
+   the close fails. An exclusive-open failure (for example EEXIST) throws
+   without calling `on-created`. Returns p."
+  [p on-created]
+  (let [fd (.openSync node-fs (str p) "wx")]
+    (try
+      (on-created)
+      (finally
+        (.closeSync node-fs fd))))
+  p)
+
 (defn exists?
   "Returns true if path exists on disk. Never throws."
   [p]

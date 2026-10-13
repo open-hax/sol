@@ -6,6 +6,7 @@
             [clio.infra.ledger :as ledger]
             [clio.infra.runtime :as runtime]
             [clojure.string :as str]
+            [open-hax.sol.domain.node.fs :as node-fs]
             [open-hax.sol.domain.node.path :as path]
             [open-hax.sol.law.lifecycle-catalog :as lifecycle]))
 
@@ -42,8 +43,11 @@
           (when (or (fs/exists? ledger-file) schema-preexisting?)
             (throw (ex-info "Clio initialization requires a fresh storage epoch" {})))
           (fs/ensure-dir! (path/dirname ledger-file))
-          (ledger/create-ledger! ledger-file)
-          (reset! ledger-created? true))
+          ;; Same empty exclusive file as ledger/create-ledger!, but ownership
+          ;; is recorded as soon as the exclusive open succeeds, so a failing
+          ;; descriptor close still rolls the new ledger back. An exclusive-open
+          ;; failure never claims (or deletes) a file another attempt created.
+          (node-fs/create-exclusive! ledger-file #(reset! ledger-created? true)))
         (do
           ;; Upstream refuses deleted/misspelled paths instead of inventing history.
           (ledger/read-ledgers [ledger-file])
@@ -52,7 +56,7 @@
             (throw (ex-info "Explicit Clio schema history is missing" {})))))
       (let [runtime (runtime/open schema-directory lifecycle/catalog)]
         (ledger/canonicalize-files (:schema/revisions runtime) [ledger-file])
-        {:runtime runtime :ledger-file ledger-file})
+        {:runtime runtime :ledger-file ledger-file :schema-directory schema-directory})
       (catch :default error
         (when @ledger-created?
           (attempt-cleanup! #(fs/delete-if-exists! ledger-file))
@@ -97,12 +101,24 @@
                    :initialize? (:clio/initialize? config)}))
     config))
 
+(defn- require-store-paths!
+  "An open store keeps writing to the paths it was opened with; a config that
+   names other paths is refused rather than returned with a mismatched store."
+  [config store]
+  (let [requested (mapv config [:clio/ledger-file :clio/schema-directory])]
+    (when (and (some some? requested)
+               (not= requested (mapv store [:ledger-file :schema-directory])))
+      (throw (ex-info "Changing Clio filesystem paths requires a full restart" {})))))
+
 (defn ensure-configured!
   "Open the opt-in store for an exported startup seam (start!, solPlugin) that
-   did not come through bootstrap!. An already-open store is kept as is."
+   did not come through bootstrap!. An already-open store is kept only while
+   the config names the same filesystem paths."
   [config]
-  (if (:clio/store config)
-    (require-supported-config! config)
+  (if-let [store (:clio/store config)]
+    (do (require-supported-config! config)
+        (require-store-paths! config store)
+        config)
     (configure! config)))
 
 (defn reconfigure!
