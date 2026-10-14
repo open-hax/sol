@@ -25,6 +25,16 @@
     (cleanup!)
     (catch :default _ nil)))
 
+(defn- path-beneath?
+  "True when `descendant` resolves strictly under `ancestor`."
+  [ancestor descendant]
+  (let [a (path/resolve ancestor)
+        d (path/resolve descendant)
+        rel (path/relative a d)]
+    (and (not= a d)
+         (not (str/blank? rel))
+         (not (str/starts-with? rel "..")))))
+
 (defn open!
   "Open explicitly named complete Clio history. Initialization requires new
    ledger/schema paths and is separate from ordinary append/reopen. A failed
@@ -43,6 +53,14 @@
         (do
           (when (or (fs/exists? ledger-file) schema-preexisting?)
             (throw (ex-info "Clio initialization requires a fresh storage epoch" {})))
+          ;; ledger-file is a file path. If it is an ancestor of schema-directory,
+          ;; ensure-dir! on the schema parent would create a directory at the
+          ;; ledger path; exclusive ledger create then fails with EEXIST, and
+          ;; rollback would leave that directory blocking every retry.
+          (when (path-beneath? ledger-file schema-directory)
+            (throw (ex-info
+                    "Clio schema directory must not be nested under the ledger file path"
+                    {:ledger-file ledger-file :schema-directory schema-directory})))
           ;; Claim the schema directory before creating the ledger parent or
           ;; file. If schema-directory is an ancestor of ledger-file,
           ;; ensure-dir! on the ledger parent would create the schema dir
@@ -70,7 +88,10 @@
         (when @ledger-created?
           (attempt-cleanup! #(fs/delete-if-exists! ledger-file)))
         (when @schema-created?
-          (attempt-cleanup! #(fs/remove-tree! schema-directory)))
+          ;; Do not remove-tree!: a concurrent initializer may have claimed a
+          ;; nested directory under this path. Only files we could have written
+          ;; and an empty owned directory are attributable to this attempt.
+          (attempt-cleanup! #(exclusive-fs/rollback-owned-directory! schema-directory)))
         (throw error)))))
 
 (defn append!

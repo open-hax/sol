@@ -108,6 +108,47 @@
           (is (re-find #"not configured" (.-message error)))))
       (finally (fs/remove-tree! root)))))
 
+(deftest ledger-as-ancestor-of-schema-is-rejected-before-creating-anything-test
+  "When ledger-file is an ancestor of schema-directory, refuse before mkdir so
+   ensure-dir! cannot leave a directory at the ledger path that blocks retries."
+  (let [root (scratch)
+        ledger-file (path/join root "epoch")
+        schema-directory (path/join ledger-file "schemas")]
+    (try
+      (is (thrown-with-msg? cljs.core/ExceptionInfo #"nested under the ledger"
+            (store/open! {:ledger-file ledger-file
+                          :schema-directory schema-directory
+                          :initialize? true})))
+      (is (not (fs/exists? ledger-file)) "nothing created at the ledger path")
+      (is (not (fs/exists? schema-directory)) "schema directory never claimed")
+      (finally (fs/remove-tree! root)))))
+
+(deftest failed-init-rollback-keeps-nested-schema-claimed-by-another-attempt-test
+  "Exclusive mkdir claims only the exact directory. A concurrent nested claim
+   under that path must survive this attempt's rollback."
+  (let [root (scratch)
+        {:keys [ledger-file schema-directory] :as opts} (options root)
+        nested (path/join schema-directory "tenant-b")
+        nested-revision (path/join nested "other.edn")
+        other "{:written/by \"nested initializer\"}
+"
+        original-open runtime/open]
+    (try
+      (with-redefs [runtime/open
+                    (fn [directory catalog]
+                      (when (= directory schema-directory)
+                        (fs/ensure-dir! nested)
+                        (fs/write-text! nested-revision other)
+                        (throw (ex-info "schema materialization failed" {})))
+                      (original-open directory catalog))]
+        (is (thrown-with-msg? cljs.core/ExceptionInfo #"schema materialization failed"
+              (store/open! (assoc opts :initialize? true)))))
+      (is (not (fs/exists? ledger-file)) "this attempt's ledger removed")
+      (is (= other (fs/read-text nested-revision))
+          "nested schema history claimed under this directory is kept")
+      (is (fs/exists? nested) "nested directory survives non-recursive rollback")
+      (finally (fs/remove-tree! root)))))
+
 (deftest schema-directory-ancestor-of-ledger-is-claimed-before-ledger-parent-test
   "When schema-directory is an ancestor of ledger-file, claiming schema first
    keeps exclusive mkdir ownership so a later failure still rolls the dir back.
