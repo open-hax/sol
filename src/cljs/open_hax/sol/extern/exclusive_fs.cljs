@@ -33,13 +33,6 @@
   (on-created)
   p)
 
-(defn- delete-if-file!
-  [p]
-  (when (.existsSync node-fs (str p))
-    (let [st (.lstatSync node-fs (str p))]
-      (when (.isFile st)
-        (.unlinkSync node-fs (str p))))))
-
 (defn link-new!
   "Publish `from` at `to` with exclusive semantics: a hard link (`link(2)`)
    fails EEXIST rather than replacing a file another process already owns
@@ -51,30 +44,34 @@
 (defn write-new-file!
   "Write `text` to a new file at p with exclusive (`wx`) semantics. Never
    creates parent directories: a vanished parent fails ENOENT instead of being
-   recreated. The caller owns p once this returns or throws after the open."
+   recreated. `writeSync` may write fewer bytes than asked, so this loops until
+   every byte is written before fsync and close; a truncated file is never
+   left for a caller to publish. `on-created` runs once the exclusive open
+   succeeds, so the caller owns p even if the write fails."
   [p text on-created]
   (let [fd (.openSync node-fs (str p) "wx")]
     (try
       (on-created)
-      (.writeSync node-fs fd (str text))
+      (let [bytes (.from js/Buffer (str text) "utf8")
+            total (.-length bytes)]
+        (loop [offset 0]
+          (when (< offset total)
+            (let [written (.writeSync node-fs fd bytes offset (- total offset))]
+              (when-not (pos? written)
+                (throw (ex-info "File write made no progress" {:path (str p) :offset offset})))
+              (recur (+ offset written))))))
       (.fsyncSync node-fs fd)
       (finally
         (.closeSync node-fs fd))))
   p)
 
-(defn rollback-owned-directory!
-  "Remove only `owned-files` under p, then the directory itself when empty.
-   Other children — nested directories, concurrent ledger files, or Clio's own
-   `<root>.edn.tmp-<uuid>` snapshots from a concurrent `runtime/open` — are
-   left in place. Clio deletes its own temporary schema file in `finally`."
-  [p owned-files]
-  (let [root (str p)]
-    (doseq [owned owned-files
-            :let [target (str owned)]]
-      (delete-if-file! target))
-    (when (.existsSync node-fs root)
-      (try
-        (.rmdirSync node-fs root)
-        (catch :default _ nil))))
+(defn remove-directory-if-empty!
+  "Release a claimed directory with non-recursive `rmdir`: it succeeds only
+   when the directory is empty, atomically, so any child another process
+   placed there (nested history, a foreign ledger, a temp snapshot) keeps the
+   directory and its contents in place. Returns p."
+  [p]
+  (try
+    (.rmdirSync node-fs (str p))
+    (catch :default _ nil))
   p)
-

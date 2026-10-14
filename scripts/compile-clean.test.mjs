@@ -9,6 +9,9 @@ import { join } from 'node:path';
 import test from 'node:test';
 
 const script = new URL('./compile-clean.sh', import.meta.url).pathname;
+// compile-clean.sh is a Bash guard run only by the Ubuntu runtime workflow;
+// Windows has no /bin/bash, so its behavioral fixtures are POSIX-only.
+const bashFixture = { skip: process.platform === 'win32' && 'Bash-only compiler guard (Ubuntu workflow)' };
 const runtimeWorkflow = readFileSync(new URL('../.github/workflows/node22-runtime.yml', import.meta.url), 'utf8');
 
 function run(output, { code = 0, artifact = true, stale = false, channel = 'stdout', target = 'server' } = {}) {
@@ -28,7 +31,7 @@ function run(output, { code = 0, artifact = true, stale = false, channel = 'stdo
 }
 
 const compiled = '[:server] Build completed. (197 files, 9 compiled, 0 warnings, 1.0s)\n';
-test('complete build with nonempty artifact passes', () => assert.equal(run(compiled).status, 0));
+test('complete build with nonempty artifact passes', bashFixture, () => assert.equal(run(compiled).status, 0));
 for (const [label, output, options] of [
   ['compiler warning', compiled.replace('0 warnings', '1 warnings'), {}],
   ['stderr warning despite zero completion counter', compiled + 'WARNING: fixture\n', { channel: 'stderr' }],
@@ -38,7 +41,7 @@ for (const [label, output, options] of [
   ['stale artifact the build did not write', compiled, { artifact: false, stale: true }],
   ['nonzero child exit after completion', compiled, { code: 7 }],
 ]) {
-  test(`reject ${label}`, () => assert.notEqual(run(output, options).status, 0));
+  test(`reject ${label}`, bashFixture, () => assert.notEqual(run(output, options).status, 0));
 }
 
 test('Node 22 runtime workflow guards both builds', () => {

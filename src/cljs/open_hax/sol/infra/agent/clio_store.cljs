@@ -78,6 +78,8 @@
         snapshot {:schema/root root :schema/catalog (:schema/catalog revision)}]
     (try
       (exclusive-fs/write-new-file! staging (str (pr-str snapshot) "\n") #(reset! staged? true))
+      ;; write-new-file! completes short writes; the reload after publishing
+      ;; verifies each snapshot hashes to its recorded root.
       (try
         (exclusive-fs/link-new! staging target)
         (catch :default error
@@ -107,17 +109,19 @@
        :schema/revisions revisions})))
 
 (defn- initialize!
-  "Create a fresh storage epoch with atomic ledger ownership. The schema
-   directory is claimed by exclusive mkdir. The ledger is created under a
-   private staging name beside the target and published with an exclusive
-   hard link only after runtime/open and canonicalization succeed. Until that
-   publish nothing exists at the ledger path, so no concurrent reopen can adopt
-   or append to a ledger this attempt might roll back; after it, the epoch is
-   committed and nothing is unlinked except the staging alias. Publishing
-   fails EEXIST if another attempt won the ledger path, and rollback removes
-   only this attempt's staging file and owned schema artifacts. The schema
-   directory is only adoptable by a reopen that names a ledger this attempt
-   never published, so rolling it back cannot strand accepted history."
+  "Create a fresh storage epoch whose artifacts stay private until commit.
+   The schema directory is claimed by exclusive mkdir and stays empty, so no
+   reopen (of this or any other ledger) can adopt it: empty history refuses.
+   runtime/open materializes the revision into a private staging directory
+   and the ledger is created under a private staging name; canonicalization
+   runs against both. Publishing is two exclusive hard links: first the
+   ledger (EEXIST if another attempt won the path), then the revision into
+   the claimed directory, which is the commit point. Before that second link
+   the claimed directory holds no revision, so no process can have opened the
+   published ledger or relied on the directory, and rollback may release them:
+   it unlinks only staging names and a ledger this attempt published, and
+   removes the claimed directory only with non-recursive rmdir, which fails
+   (and keeps it) once anything else lives there."
   [ledger-file schema-directory]
   (when (or (fs/exists? ledger-file) (fs/exists? schema-directory))
     (throw (ex-info "Clio initialization requires a fresh storage epoch" {})))
@@ -131,36 +135,51 @@
     (throw (ex-info
             "Clio ledger file and schema directory must not nest"
             {:ledger-file ledger-file :schema-directory schema-directory})))
-  (let [staging (str ledger-file ".init-" (random-uuid))
-        staging-created? (atom false)
-        schema-created? (atom false)]
+  (let [attempt (random-uuid)
+        staging-ledger (str ledger-file ".init-" attempt)
+        staging-schema (str schema-directory ".init-" attempt)
+        staging-ledger? (atom false)
+        staging-schema? (atom false)
+        schema-claimed? (atom false)
+        ledger-published? (atom false)]
     (try
       ;; Claim the schema directory before creating the ledger parent or
       ;; staging file so exclusive mkdir owns the directory even when a later
       ;; step fails.
       (fs/ensure-dir! (path/dirname schema-directory))
-      (exclusive-fs/create-directory! schema-directory #(reset! schema-created? true))
+      (exclusive-fs/create-directory! schema-directory #(reset! schema-claimed? true))
+      (exclusive-fs/create-directory! staging-schema #(reset! staging-schema? true))
       (fs/ensure-dir! (path/dirname ledger-file))
       ;; Ownership is recorded as soon as the exclusive open succeeds, so a
       ;; failing descriptor close still rolls the staging file back.
-      (exclusive-fs/create-file! staging #(reset! staging-created? true))
-      (let [runtime (runtime/open schema-directory lifecycle/catalog)
-            _ (ledger/canonicalize-files (:schema/revisions runtime) [staging])]
-        (exclusive-fs/link-new! staging ledger-file)
-        ;; Committed: the ledger path now names this epoch. Only the private
-        ;; staging alias remains to drop; its failure cannot undo the commit.
-        (reset! schema-created? false)
-        (attempt-cleanup! #(fs/delete-if-exists! staging))
-        (reset! staging-created? false)
-        {:runtime runtime :ledger-file ledger-file :schema-directory schema-directory})
+      (exclusive-fs/create-file! staging-ledger #(reset! staging-ledger? true))
+      (let [staged (runtime/open staging-schema lifecycle/catalog)
+            root (:schema/root (:schema/current staged))
+            _ (ledger/canonicalize-files (:schema/revisions staged) [staging-ledger])]
+        (exclusive-fs/link-new! staging-ledger ledger-file)
+        (reset! ledger-published? true)
+        (exclusive-fs/link-new! (schema-store/revision-path staging-schema root)
+                                (schema-store/revision-path schema-directory root))
+        ;; Committed. Only private staging aliases remain to drop; their
+        ;; failure cannot undo the commit.
+        (reset! schema-claimed? false)
+        (reset! ledger-published? false)
+        (attempt-cleanup! #(fs/delete-if-exists! staging-ledger))
+        (attempt-cleanup! #(fs/remove-tree! staging-schema))
+        (reset! staging-ledger? false)
+        (reset! staging-schema? false)
+        {:runtime (assoc staged :schema/directory schema-directory)
+         :ledger-file ledger-file
+         :schema-directory schema-directory})
       (catch :default error
-        (when @staging-created?
-          (attempt-cleanup! #(fs/delete-if-exists! staging)))
-        (when @schema-created?
-          (attempt-cleanup!
-           #(exclusive-fs/rollback-owned-directory!
-             schema-directory
-             [(schema-store/revision-path schema-directory (:schema/root @local-revision))])))
+        (when @ledger-published?
+          (attempt-cleanup! #(fs/delete-if-exists! ledger-file)))
+        (when @staging-ledger?
+          (attempt-cleanup! #(fs/delete-if-exists! staging-ledger)))
+        (when @staging-schema?
+          (attempt-cleanup! #(fs/remove-tree! staging-schema)))
+        (when @schema-claimed?
+          (attempt-cleanup! #(exclusive-fs/remove-directory-if-empty! schema-directory)))
         (throw error)))))
 
 (defn- reopen!
