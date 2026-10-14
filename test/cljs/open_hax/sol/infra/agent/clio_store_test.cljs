@@ -45,6 +45,10 @@
   (filterv #(str/ends-with? % ".edn") (fs/list-files schema-directory)))
 (defn error-kind [f]
   (try (f) nil (catch :default error (:clio/error (ex-data error)))))
+
+(def init-marker-name ".sol-clio-init")
+(defn init-marker-path [schema-directory]
+  (path/join schema-directory init-marker-name))
 (defn ^:async promise-rejection [f]
   ;; A container preserves the returned Promise across the async try expression.
   (let [[result] (try
@@ -506,6 +510,134 @@
 
 (defn- evolved-revision []
   (schema/materialize crypto/sha256 (dissoc lifecycle/catalog :sol.turn/completed)))
+
+
+(deftest eexist-host-code-belongs-in-exclusive-fs-extern-test
+  "AGENTS.md: nothing above extern handles a raw host object. Infra must not
+   decode Node's `.code`; exclusive-fs classifies EEXIST as shaped data."
+  (let [infra (fs/read-text "src/cljs/open_hax/sol/infra/agent/clio_store.cljs")
+        exclusive (fs/read-text "src/cljs/open_hax/sol/extern/exclusive_fs.cljs")]
+    (is (not (re-find #"\(\.-code " infra))
+        "infra must not read Node error .code")
+    (is (re-find #":already-exists" exclusive)
+        "exclusive-fs classifies EEXIST as :already-exists")))
+
+(deftest link-new-classifies-eexist-as-shaped-data-test
+  (let [root (scratch)
+        from (path/join root "from")
+        to (path/join root "to")]
+    (try
+      (fs/ensure-dir! root)
+      (fs/write-text! from "a\n")
+      (fs/write-text! to "b\n")
+      (let [error (try (exclusive-fs/link-new! from to) nil (catch :default e e))]
+        (is (= :already-exists (:exclusive-fs/error (ex-data error)))
+            "EEXIST becomes shaped :already-exists")
+        (is (= (str to) (:path (ex-data error)))))
+      (finally (fs/remove-tree! root)))))
+
+(deftest concurrent-evolution-accepts-peer-publish-without-host-code-test
+  "When another opener already published the same evolved root, link-new!
+   reports :already-exists and reopen accepts the peer's snapshot."
+  (let [root (scratch)
+        {:keys [schema-directory] :as opts} (options root)
+        evolved (evolved-revision)
+        original-link exclusive-fs/link-new!]
+    (try
+      (store/open! (assoc opts :initialize? true))
+      (with-redefs [store/local-revision (delay evolved)
+                    exclusive-fs/link-new!
+                    (fn [from to]
+                      ;; Peer published the same root first.
+                      (original-link from to)
+                      (original-link from to))]
+        (let [reopened (store/open! opts)]
+          (is (= (:schema/root evolved) (:schema/root (store/current-revision reopened))))
+          (is (contains? (set (fs/list-files schema-directory))
+                         (str (:schema/root evolved) ".edn")))))
+      (finally (fs/remove-tree! root)))))
+
+(deftest process-death-after-ledger-publish-resumes-from-marker-test
+  "Process death after the ledger hard-link and before the schema revision
+   link leaves a published ledger, an empty claimed schema directory, and
+   private staging. A durable init marker lets the next open resume."
+  (let [root (scratch)
+        {:keys [ledger-file schema-directory] :as opts} (options root)
+        original-link exclusive-fs/link-new!
+        mid (atom nil)]
+    (try
+      (with-redefs [exclusive-fs/link-new!
+                    (fn [from to]
+                      (if (= to ledger-file)
+                        (do (original-link from to)
+                            (reset! mid
+                                    {:ledger (fs/read-text ledger-file)
+                                     :marker (when (fs/exists? (init-marker-path schema-directory))
+                                               (fs/read-text (init-marker-path schema-directory)))
+                                     :staging-schema
+                                     (first (schema-staging-leftovers schema-directory))
+                                     :staging-schema-files
+                                     (let [d (first (schema-staging-leftovers schema-directory))]
+                                       (when d
+                                         (let [dir (path/join (path/dirname schema-directory) d)]
+                                           (into {} (for [f (fs/list-files dir)]
+                                                      [f (fs/read-text (path/join dir f))])))))
+                                     :staging-ledger (first (staging-leftovers ledger-file))
+                                     :staging-ledger-bytes
+                                     (let [f (first (staging-leftovers ledger-file))]
+                                       (when f
+                                         (fs/read-text (path/join (path/dirname ledger-file) f))))})
+                            (throw (ex-info "process killed" {})))
+                        (original-link from to)))]
+        (is (thrown-with-msg? cljs.core/ExceptionInfo #"process killed"
+              (store/open! (assoc opts :initialize? true)))))
+      ;; Catch rolled the attempt back; restore the mid-publish death state.
+      (let [{:keys [ledger marker staging-schema staging-schema-files
+                    staging-ledger staging-ledger-bytes]} @mid]
+        (is (some? marker) "initialization writes a durable marker before publish")
+        (when marker
+          (fs/ensure-dir! (path/dirname ledger-file))
+          (fs/write-text! ledger-file ledger)
+          (fs/ensure-dir! schema-directory)
+          (fs/write-text! (init-marker-path schema-directory) marker)
+          (when staging-schema
+            (let [dir (path/join (path/dirname schema-directory) staging-schema)]
+              (fs/ensure-dir! dir)
+              (doseq [[f bytes] staging-schema-files]
+                (fs/write-text! (path/join dir f) bytes))))
+          (when staging-ledger
+            (fs/write-text! (path/join (path/dirname ledger-file) staging-ledger)
+                            staging-ledger-bytes))
+          (let [canonical-store (store/open! opts)]
+            (is (= [] (store/events canonical-store)) "reopen resumes the incomplete epoch")
+            (is (not (fs/exists? (init-marker-path schema-directory))) "marker cleared after resume")
+            (is (seq (visible-revisions schema-directory)) "schema revision published")
+            (is (= [] (staging-leftovers ledger-file)))
+            (is (= [] (schema-staging-leftovers schema-directory))))))
+      (finally (fs/remove-tree! root)))))
+
+(deftest process-death-without-staging-rolls-back-via-marker-test
+  "If staging is gone after process death, the marker still identifies an
+   incomplete epoch so startup can roll it back and initialize fresh."
+  (let [root (scratch)
+        {:keys [ledger-file schema-directory] :as opts} (options root)
+        marker (pr-str {:sol.clio/init-pending true
+                        :ledger-file ledger-file
+                        :schema-directory schema-directory
+                        :staging-ledger (str ledger-file ".init-dead")
+                        :staging-schema (str schema-directory ".init-dead")
+                        :schema/root "deadroot"})]
+    (try
+      (fs/ensure-dir! (path/dirname ledger-file))
+      (fs/write-text! ledger-file "")
+      (fs/ensure-dir! schema-directory)
+      (fs/write-text! (init-marker-path schema-directory) marker)
+      (let [canonical-store (store/open! (assoc opts :initialize? true))]
+        (is (= [] (store/events canonical-store))
+            "initialize rolls back the incomplete epoch then creates a fresh one")
+        (is (not (fs/exists? (init-marker-path schema-directory))))
+        (is (seq (visible-revisions schema-directory))))
+      (finally (fs/remove-tree! root)))))
 
 (deftest reopen-persists-an-evolved-revision-into-existing-history-test
   "A source catalog edit still adds its revision on reopen, written only into
