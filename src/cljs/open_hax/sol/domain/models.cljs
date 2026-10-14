@@ -16,11 +16,12 @@
 
 (defn- parse-prefix-allowlist
   [raw]
-  (-> (str (or raw ""))
-      (str/split #",")
-      (->> (map (fn [v] (some-> v str str/trim not-empty)))
-           (remove nil?)
-           vec)))
+  (->> (if (sequential? raw)
+         raw
+         (str/split (str (or raw "")) #","))
+       (map (fn [v] (some-> v str str/trim not-empty)))
+       (remove nil?)
+       vec))
 
 (defn normalize-thinking-level
   [value]

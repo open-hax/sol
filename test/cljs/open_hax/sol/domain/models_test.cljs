@@ -93,3 +93,13 @@
               (models/enrich-config contract-config (env-lookup {}))
               ["glm-5"])]
     (is (= "PROXX_CONTRACT_TOKEN" (get-in data [:providers :proxx :apiKey])))))
+
+(deftest repeated-enrich-config-preserves-parsed-prefix-allowlist
+  (testing "start! then register-app-routes! re-enrich must not stringify the vector"
+    (let [env (env-lookup {"SOL_MODEL_PREFIX_ALLOWLIST" "glm-5,gpt-5"})
+          once (models/enrich-config {:contracts-dir "test/fixtures/empty-contracts"} env)
+          twice (models/enrich-config once env)]
+      (is (= ["glm-5" "gpt-5"] (:model-prefix-allowlist once)))
+      (is (= ["glm-5" "gpt-5"] (:model-prefix-allowlist twice)))
+      (is (models/allowlisted-model-id? twice "gpt-5-mini"))
+      (is (not (models/allowlisted-model-id? twice "[glm-5 gpt-5]"))))))

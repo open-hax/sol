@@ -112,11 +112,18 @@
 
 (defn- require-store-paths!
   "An open store keeps writing to the paths it was opened with; a config that
-   names other paths is refused rather than returned with a mismatched store."
+   names other paths is refused rather than returned with a mismatched store.
+   Pre-schema-directory store maps omit :schema-directory; a missing key is
+   not a path change when the ledger file still matches."
   [config store]
-  (let [requested (mapv config [:clio/ledger-file :clio/schema-directory])]
-    (when (and (some some? requested)
-               (not= requested (mapv store [:ledger-file :schema-directory])))
+  (let [requested-ledger (:clio/ledger-file config)
+        requested-schema (:clio/schema-directory config)
+        store-ledger (:ledger-file store)
+        store-schema (:schema-directory store)]
+    (when (and (or (some? requested-ledger) (some? requested-schema))
+               (or (not= requested-ledger store-ledger)
+                   (and (some? store-schema)
+                        (not= requested-schema store-schema))))
       (throw (ex-info "Changing Clio filesystem paths requires a full restart" {})))))
 
 (defn ensure-configured!

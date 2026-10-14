@@ -225,6 +225,25 @@
         (is (not (fs/exists? (path/join root "other.edn")))))
       (finally (fs/remove-tree! root)))))
 
+(deftest ensure-configured-tolerates-legacy-store-without-schema-directory-test
+  "Hot reload can carry a pre-PR store map that only recorded :ledger-file.
+   Missing :schema-directory is not a path change when the ledger still matches."
+  (let [root (scratch)
+        ledger (:ledger-file (options root))
+        schema (:schema-directory (options root))
+        legacy-store {:runtime :legacy-runtime :ledger-file ledger}
+        config {:clio/ledger-file ledger
+                :clio/schema-directory schema
+                :clio/store legacy-store}]
+    (try
+      (is (identical? legacy-store (:clio/store (store/ensure-configured! config)))
+          "legacy store is kept when ledger matches")
+      (is (thrown-with-msg? cljs.core/ExceptionInfo #"full restart"
+            (store/ensure-configured!
+             (assoc config :clio/ledger-file (path/join root "other.edn"))))
+          "a real ledger change still requires a full restart")
+      (finally (fs/remove-tree! root)))))
+
 (deftest failed-reopen-leaves-existing-history-test
   (let [root (scratch)
         {:keys [ledger-file schema-directory] :as opts} (options root)]
