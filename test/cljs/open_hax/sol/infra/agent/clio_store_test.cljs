@@ -34,6 +34,15 @@
   [ledger-file]
   (let [prefix (str (path/basename ledger-file) ".init-")]
     (filterv #(str/starts-with? % prefix) (fs/list-files (path/dirname ledger-file)))))
+(defn schema-staging-leftovers
+  "Initialization schema staging directories (`<schemas>.init-*`)."
+  [schema-directory]
+  (let [prefix (str (path/basename schema-directory) ".init-")]
+    (filterv #(str/starts-with? % prefix) (fs/list-files (path/dirname schema-directory)))))
+(defn visible-revisions
+  "Snapshot names Clio's load-revisions would read from the directory."
+  [schema-directory]
+  (filterv #(str/ends-with? % ".edn") (fs/list-files schema-directory)))
 (defn error-kind [f]
   (try (f) nil (catch :default error (:clio/error (ex-data error)))))
 (defn ^:async promise-rejection [f]
@@ -168,13 +177,12 @@
     (try
       (with-redefs [runtime/open
                     (fn [directory catalog]
-                      (when (= directory schema-directory)
-                        (original-open directory catalog)
-                        (fs/ensure-dir! nested)
-                        (fs/write-text! nested-revision other)
-                        (fs/write-text! foreign-ledger foreign)
-                        (throw (ex-info "schema materialization failed" {})))
-                      (original-open directory catalog))]
+                      (original-open directory catalog)
+                      ;; Concurrent children appear under the claimed path.
+                      (fs/ensure-dir! nested)
+                      (fs/write-text! nested-revision other)
+                      (fs/write-text! foreign-ledger foreign)
+                      (throw (ex-info "schema materialization failed" {})))]
         (is (thrown-with-msg? cljs.core/ExceptionInfo #"schema materialization failed"
               (store/open! (assoc opts :initialize? true)))))
       (is (not (fs/exists? ledger-file)) "this attempt's ledger removed")
@@ -365,6 +373,89 @@
               (and (fs/exists? ledger-file) (= accepted (fs/read-text ledger-file))))
           "an accepted concurrent append survives rollback")
       (finally (fs/remove-tree! root)))))
+
+(deftest initialization-keeps-schema-history-unadoptable-until-the-ledger-commits-test
+  "A process reopening a different existing ledger against the same schema
+   directory must not be able to adopt this attempt's revision before commit:
+   if this attempt then loses the ledger publish, rollback would strand that
+   process's accepted history."
+  (let [root (scratch)
+        {:keys [ledger-file schema-directory] :as opts} (options root)
+        ledger-b (path/join root "tenant-b" "events.edn")
+        competing "{:written/by \"competing publisher\"}\n"
+        visible-at-publish (atom nil)
+        adopt-error (atom nil)
+        original-link exclusive-fs/link-new!]
+    (try
+      (fs/ensure-dir! (path/dirname ledger-b))
+      (ledger/create-ledger! ledger-b)
+      (with-redefs [exclusive-fs/link-new!
+                    (fn [from to]
+                      (when (= to ledger-file)
+                        (reset! visible-at-publish (visible-revisions schema-directory))
+                        (reset! adopt-error
+                                (try (store/open! {:ledger-file ledger-b :schema-directory schema-directory})
+                                     nil
+                                     (catch :default e (.-message e))))
+                        (fs/write-text! ledger-file competing))
+                      (original-link from to))]
+        (is (thrown-with-msg? js/Error #"EEXIST"
+              (store/open! (assoc opts :initialize? true)))))
+      (is (= [] @visible-at-publish) "no schema revision is visible before the ledger commits")
+      (is (some->> @adopt-error (re-find #"schema history"))
+          "a concurrent reopen of another ledger cannot adopt the uncommitted schema directory")
+      (is (= competing (fs/read-text ledger-file)) "the competing publisher's ledger is kept")
+      (is (= [] (staging-leftovers ledger-file)))
+      (is (= [] (schema-staging-leftovers schema-directory)) "schema staging removed")
+      (is (not (fs/exists? schema-directory)) "empty claimed schema directory released")
+      (finally (fs/remove-tree! root)))))
+
+(deftest schema-publish-failure-after-ledger-publish-rolls-back-the-epoch-test
+  "The schema revision publish is the commit point. While the claimed schema
+   directory holds no revision no reopen can succeed against the published
+   ledger, so a failed schema publish still rolls the whole epoch back."
+  (let [root (scratch)
+        {:keys [ledger-file schema-directory] :as opts} (options root)
+        original-link exclusive-fs/link-new!]
+    (try
+      (with-redefs [exclusive-fs/link-new!
+                    (fn [from to]
+                      (if (str/starts-with? (str to) (str schema-directory "/"))
+                        (throw (ex-info "schema publish failed" {}))
+                        (original-link from to)))]
+        (is (thrown-with-msg? cljs.core/ExceptionInfo #"schema publish failed"
+              (store/open! (assoc opts :initialize? true)))))
+      (is (not (fs/exists? ledger-file)) "unadoptable published ledger rolled back")
+      (is (not (fs/exists? schema-directory)))
+      (is (= [] (staging-leftovers ledger-file)))
+      (is (= [] (schema-staging-leftovers schema-directory)))
+      (let [canonical-store (store/open! (assoc opts :initialize? true))]
+        (is (= [] (store/events canonical-store)) "retry still sees a fresh storage epoch"))
+      (finally (fs/remove-tree! root)))))
+
+;; A short fs.writeSync must not leave a truncated snapshot to be published.
+(deftest write-new-file-completes-short-writes-test
+  (let [root (scratch)
+        target (path/join root "snapshot.edn")
+        text (apply str (repeat 64 "{:schema/root \"abc\"}"))
+        original-write (.-writeSync node-fs)]
+    (try
+      (fs/ensure-dir! root)
+      (set! (.-writeSync node-fs)
+            (fn [fd data & args]
+              ;; Accept at most 7 bytes per call, as a short write would,
+              ;; whether called with a string or a buffer slice.
+              (let [bytes (if (string? data)
+                            (.from js/Buffer data "utf8")
+                            (let [[offset length] args]
+                              (.subarray data (or offset 0) (+ (or offset 0) (or length (.-length data))))))]
+                (.call original-write node-fs fd (.subarray bytes 0 (min 7 (.-length bytes)))))))
+      (exclusive-fs/write-new-file! target text (fn [] nil))
+      (set! (.-writeSync node-fs) original-write)
+      (is (= text (fs/read-text target)) "every byte written before close")
+      (finally
+        (set! (.-writeSync node-fs) original-write)
+        (fs/remove-tree! root)))))
 
 (deftest successful-initialization-publishes-the-ledger-and-removes-staging-test
   (let [root (scratch)
