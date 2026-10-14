@@ -213,6 +213,18 @@
           "alias schemas parent never created")
       (finally (fs/remove-tree! root)))))
 
+(deftest realpath-host-access-belongs-in-exclusive-fs-extern-test
+  "AGENTS.md: host filesystem access belongs in extern.*; domain.* stays pure.
+   The nest-check realpath must not live in domain.node.fs."
+  (let [domain (fs/read-text "src/cljs/open_hax/sol/domain/node/fs.cljs")
+        exclusive (fs/read-text "src/cljs/open_hax/sol/extern/exclusive_fs.cljs")]
+    (is (re-find #"\.realpathSync" exclusive)
+        "realpathSync belongs in exclusive-fs extern")
+    (is (not (re-find #"\.realpathSync" domain))
+        "domain.node.fs must not call realpathSync")
+    (is (re-find #"\(defn realpath" exclusive)
+        "exclusive-fs exposes realpath for infra callers")))
+
 (deftest reopen-rechecks-schema-directory-after-ledger-read-test
   "On reopen, if the schema directory exists at entry but is removed while
    read-ledgers runs, refuse missing history rather than letting runtime/open
