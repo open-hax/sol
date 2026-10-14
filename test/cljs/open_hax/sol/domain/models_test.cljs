@@ -94,8 +94,18 @@
               ["glm-5"])]
     (is (= "PROXX_CONTRACT_TOKEN" (get-in data [:providers :proxx :apiKey])))))
 
+(deftest parse-prefix-allowlist-accepts-string-and-sequential-input
+  (testing "comma-separated strings still split and trim"
+    (is (= ["glm-5" "gpt-5"] (models/parse-prefix-allowlist "glm-5, gpt-5")))
+    (is (= [] (models/parse-prefix-allowlist nil)))
+    (is (= [] (models/parse-prefix-allowlist ""))))
+  (testing "sequential input is preserved, never stringified into one prefix"
+    (is (= ["glm-5" "gpt-5"] (models/parse-prefix-allowlist ["glm-5" "gpt-5"])))
+    (is (= ["glm-5"] (models/parse-prefix-allowlist ["  glm-5  " "" nil])))
+    (is (not= ["[glm-5 gpt-5]"] (models/parse-prefix-allowlist ["glm-5" "gpt-5"])))))
+
 (deftest repeated-enrich-config-preserves-parsed-prefix-allowlist
-  (testing "start! then register-app-routes! re-enrich must not stringify the vector"
+  (testing "merge-precedence idempotence: config's vector wins on re-enrich"
     (let [env (env-lookup {"SOL_MODEL_PREFIX_ALLOWLIST" "glm-5,gpt-5"})
           once (models/enrich-config {:contracts-dir "test/fixtures/empty-contracts"} env)
           twice (models/enrich-config once env)]

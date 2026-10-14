@@ -27,7 +27,10 @@
 
 (defn- path-beneath?
   "True when `descendant` resolves strictly under `ancestor`.
-   An absolute relative (Windows cross-drive) is not a descendant."
+   An absolute relative (Windows cross-drive) is not a descendant.
+   Parent-escape is a path-segment check: a component named exactly `..`
+   escapes; a sibling segment that merely starts with `..` (e.g. `..d`)
+   remains a descendant."
   [ancestor descendant]
   (let [a (path/resolve ancestor)
         d (path/resolve descendant)
@@ -35,7 +38,7 @@
     (and (not= a d)
          (not (str/blank? rel))
          (not (path/absolute? rel))
-         (not (str/starts-with? rel "..")))))
+         (not (some #(= ".." %) (str/split rel #"[\\/]"))))))
 
 (defn open!
   "Open explicitly named complete Clio history. Initialization requires new

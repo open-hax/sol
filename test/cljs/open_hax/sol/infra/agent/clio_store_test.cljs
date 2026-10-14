@@ -123,6 +123,24 @@
       (is (not (fs/exists? schema-directory)) "schema directory never claimed")
       (finally (fs/remove-tree! root)))))
 
+(deftest ledger-ancestor-with-dotdot-prefixed-schema-component-is-rejected-test
+  "A schema path under the ledger that uses a '..'-prefixed component
+   (e.g. epoch/..d/schemas) is still nested. A string-prefix escape check
+   misses it: ensure-dir! then leaves a directory at the ledger path that
+   blocks every retry until manual cleanup."
+  (let [root (scratch)
+        ledger-file (path/join root "epoch")
+        schema-directory (path/join ledger-file "..d" "schemas")]
+    (try
+      (is (thrown-with-msg? cljs.core/ExceptionInfo #"must not nest"
+            (store/open! {:ledger-file ledger-file
+                          :schema-directory schema-directory
+                          :initialize? true})))
+      (is (not (fs/exists? ledger-file)) "nothing created at the ledger path")
+      (is (not (fs/exists? (path/dirname schema-directory)))
+          "dotdot-prefixed parent under ledger never created")
+      (finally (fs/remove-tree! root)))))
+
 (deftest failed-init-rollback-keeps-concurrent-children-under-schema-directory-test
   "Rollback deletes only this attempt's schema revision artifact. A concurrent
    nested schema directory or sibling ledger file under the claimed path is kept."
