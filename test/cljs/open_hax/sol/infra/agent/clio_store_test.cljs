@@ -1,5 +1,6 @@
 (ns open-hax.sol.infra.agent.clio-store-test
-  (:require [cljs.test :refer [deftest is]]
+  (:require [cljs.reader :as reader]
+            [cljs.test :refer [deftest is]]
             [clio.domain.schema :as schema]
             [clio.extern.js.crypto :as crypto]
             [clio.extern.js.fs :as fs]
@@ -592,22 +593,32 @@
         (is (thrown-with-msg? cljs.core/ExceptionInfo #"process killed"
               (store/open! (assoc opts :initialize? true)))))
       ;; Catch rolled the attempt back; restore the mid-publish death state.
-      (let [{:keys [ledger marker staging-schema staging-schema-files
+      (let [{:keys [marker staging-schema staging-schema-files
                     staging-ledger staging-ledger-bytes]} @mid]
         (is (some? marker) "initialization writes a durable marker before publish")
         (when marker
           (fs/ensure-dir! (path/dirname ledger-file))
-          (fs/write-text! ledger-file ledger)
           (fs/ensure-dir! schema-directory)
-          (fs/write-text! (init-marker-path schema-directory) marker)
           (when staging-schema
             (let [dir (path/join (path/dirname schema-directory) staging-schema)]
               (fs/ensure-dir! dir)
               (doseq [[f bytes] staging-schema-files]
                 (fs/write-text! (path/join dir f) bytes))))
-          (when staging-ledger
-            (fs/write-text! (path/join (path/dirname ledger-file) staging-ledger)
-                            staging-ledger-bytes))
+          ;; Restore ledger as a hard link of the restored staging file and
+          ;; rewrite the marker with that inode so resume does not depend on
+          ;; the filesystem reusing the freed identity after rollback.
+          (let [staged (path/join (path/dirname ledger-file) staging-ledger)]
+            ;; Throw inside link-new! can leave ledger-file behind because
+            ;; ledger-published? is set only after link-new! returns; clear it
+            ;; so the restored hard link is the sole name we control.
+            (fs/delete-if-exists! ledger-file)
+            (fs/write-text! staged staging-ledger-bytes)
+            (.linkSync node-fs staged ledger-file)
+            (fs/write-text! (init-marker-path schema-directory)
+                            (str (pr-str (assoc (reader/read-string marker)
+                                               :ledger-identity
+                                               (exclusive-fs/file-identity ledger-file)))
+                                 "\n")))
           (let [canonical-store (store/open! (assoc opts :initialize? true))]
             (is (= [] (store/events canonical-store))
                 "initialize? after resume reopens the committed epoch")
