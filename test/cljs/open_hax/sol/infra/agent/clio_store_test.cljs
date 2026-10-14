@@ -1,15 +1,20 @@
 (ns open-hax.sol.infra.agent.clio-store-test
   (:require [cljs.test :refer [deftest is]]
+            [clio.domain.schema :as schema]
+            [clio.extern.js.crypto :as crypto]
             [clio.extern.js.fs :as fs]
             [clio.infra.event :as event]
             [clio.infra.ledger :as ledger]
             [clio.infra.runtime :as runtime]
+            [clio.infra.schema-store :as schema-store]
+            [clojure.string :as str]
             [open-hax.sol.clio-native-probe :as probe]
             [open-hax.sol.domain.node.path :as path]
             [open-hax.sol.extern.exclusive-fs :as exclusive-fs]
             [open-hax.sol.infra.agent.clio-store :as store]
             [open-hax.sol.infra.agent.episode-ledger :as episode]
             [open-hax.sol.infra.agent.session-store :as sessions]
+            [open-hax.sol.law.lifecycle-catalog :as lifecycle]
             ["node:fs" :as node-fs]))
 
 (defn scratch [] (path/resolve ".ημ" "sol-clio-tests" (str (random-uuid))))
@@ -24,6 +29,11 @@
     :event/data {:run/id "test-run" :session/id "test-session" :turn/id "test-turn"
                  :episode/id "test-episode" :event/from {:actor-id "sol.test"}
                  :delivery/mode "stream" :payload {:status "running"}}}))
+(defn staging-leftovers
+  "Initialization staging files (`<ledger>.init-*`) left beside the ledger."
+  [ledger-file]
+  (let [prefix (str (path/basename ledger-file) ".init-")]
+    (filterv #(str/starts-with? % prefix) (fs/list-files (path/dirname ledger-file)))))
 (defn error-kind [f]
   (try (f) nil (catch :default error (:clio/error (ex-data error)))))
 (defn ^:async promise-rejection [f]
@@ -277,25 +287,173 @@
         (is (thrown-with-msg? cljs.core/ExceptionInfo #"descriptor close failed"
               (store/open! (assoc opts :initialize? true)))))
       (is (not (fs/exists? ledger-file)) "ledger created by this attempt removed")
+      (is (= [] (staging-leftovers ledger-file)) "staging file created by this attempt removed")
       (is (not (fs/exists? schema-directory)))
       (let [canonical-store (store/open! (assoc opts :initialize? true))]
         (is (= [] (store/events canonical-store)) "retry still sees a fresh storage epoch"))
       (finally (fs/remove-tree! root)))))
 
-(deftest exclusive-open-failure-never-deletes-another-attempts-ledger-test
+(deftest exclusive-publish-failure-never-deletes-another-attempts-ledger-test
+  "Another attempt can win the ledger path between the fresh-epoch check and
+   this attempt's exclusive publish. Publishing is an exclusive link, so it
+   fails EEXIST and rollback removes only this attempt's private staging file
+   and schema directory, never the other attempt's ledger."
   (let [root (scratch)
-        {:keys [ledger-file] :as opts} (options root)
-        other "{:written/by \"another attempt\"}\n"]
+        {:keys [ledger-file schema-directory] :as opts} (options root)
+        other "{:written/by \"another attempt\"}\n"
+        original-link exclusive-fs/link-new!]
     (try
-      (with-redefs [exclusive-fs/create-file!
-                    (fn [p _on-created]
-                      ;; Another attempt won the race between the fresh-epoch
-                      ;; check and the exclusive open.
-                      (fs/write-text! p other)
-                      (throw (js/Error. "EEXIST: file already exists")))]
+      (with-redefs [exclusive-fs/link-new!
+                    (fn [from to]
+                      (fs/write-text! to other)
+                      (original-link from to))]
         (is (thrown-with-msg? js/Error #"EEXIST"
               (store/open! (assoc opts :initialize? true)))))
       (is (= other (fs/read-text ledger-file)) "the other attempt's ledger is kept")
+      (is (= [] (staging-leftovers ledger-file)) "this attempt's staging file removed")
+      (is (not (fs/exists? schema-directory)) "this attempt's schema directory removed")
+      (finally (fs/remove-tree! root)))))
+
+(deftest initialization-keeps-the-ledger-unreachable-until-commit-test
+  "Ownership must be atomic through rollback: while runtime/open and
+   canonicalization run, nothing exists at the ledger path, so a concurrent
+   reopen cannot adopt and append to a ledger this attempt may still unlink."
+  (let [root (scratch)
+        {:keys [ledger-file schema-directory] :as opts} (options root)
+        visible (atom nil)
+        reopen-error (atom nil)
+        original-open runtime/open]
+    (try
+      (with-redefs [runtime/open
+                    (fn [directory catalog]
+                      (let [result (original-open directory catalog)]
+                        (reset! visible (fs/exists? ledger-file))
+                        (reset! reopen-error (error-kind #(ledger/read-ledgers [ledger-file])))
+                        (throw (ex-info "schema materialization failed" {}))
+                        result))]
+        (is (thrown-with-msg? cljs.core/ExceptionInfo #"schema materialization failed"
+              (store/open! (assoc opts :initialize? true)))))
+      (is (false? @visible) "ledger path is not published before commit")
+      (is (= :clio.ledger/missing-file @reopen-error)
+          "a concurrent reopen during initialization refuses instead of adopting")
+      (is (not (fs/exists? ledger-file)))
+      (is (= [] (staging-leftovers ledger-file)) "staging file rolled back")
+      (is (not (fs/exists? schema-directory)))
+      (finally (fs/remove-tree! root)))))
+
+(deftest rollback-ownership-check-cannot-race-a-concurrent-append-test
+  "An append landing between an emptiness check and the unlink must never be
+   lost. Rollback may only remove artifacts no other process can reach."
+  (let [root (scratch)
+        {:keys [ledger-file] :as opts} (options root)
+        accepted "{:accepted/by \"concurrent opener\"}\n"
+        appended? (atom false)
+        original-delete fs/delete-if-exists!]
+    (try
+      (with-redefs [runtime/open (fn [_ _] (throw (ex-info "schema materialization failed" {})))
+                    fs/delete-if-exists!
+                    (fn [p]
+                      ;; A concurrent opener appends just before any unlink of
+                      ;; the ledger path.
+                      (when (and (= p ledger-file) (fs/exists? ledger-file))
+                        (fs/append-text! ledger-file accepted)
+                        (reset! appended? true))
+                      (original-delete p))]
+        (is (thrown-with-msg? cljs.core/ExceptionInfo #"schema materialization failed"
+              (store/open! (assoc opts :initialize? true)))))
+      (is (or (not @appended?)
+              (and (fs/exists? ledger-file) (= accepted (fs/read-text ledger-file))))
+          "an accepted concurrent append survives rollback")
+      (finally (fs/remove-tree! root)))))
+
+(deftest successful-initialization-publishes-the-ledger-and-removes-staging-test
+  (let [root (scratch)
+        {:keys [ledger-file] :as opts} (options root)]
+    (try
+      (let [canonical-store (store/open! (assoc opts :initialize? true))]
+        (is (= "" (fs/read-text ledger-file)) "published ledger is the empty new epoch")
+        (is (= [] (staging-leftovers ledger-file)) "staging name unlinked after publish")
+        (is (= :appended (store/append! canonical-store (candidate canonical-store 1 [])))))
+      (finally (fs/remove-tree! root)))))
+
+(deftest reopen-never-calls-a-schema-creating-operation-test
+  "Reopen must load schema history through non-creating operations only:
+   runtime/open and ensure-revision! recreate a directory that vanished after
+   validation, silently inventing missing history."
+  (let [root (scratch)
+        opts (options root)
+        creating-calls (atom [])]
+    (try
+      (store/open! (assoc opts :initialize? true))
+      (with-redefs [runtime/open (fn [& args] (swap! creating-calls conj [:runtime/open args])
+                                   (throw (ex-info "creating open" {})))
+                    schema-store/ensure-revision! (fn [& args] (swap! creating-calls conj [:ensure-revision! args])
+                                                    (throw (ex-info "creating ensure" {})))
+                    fs/ensure-dir! (fn [& args] (swap! creating-calls conj [:ensure-dir! args])
+                                     (throw (ex-info "creating mkdir" {})))]
+        (let [reopened (store/open! opts)]
+          (is (= [] (store/events reopened)))))
+      (is (= [] @creating-calls) "reopen performed no creating schema operation")
+      (finally (fs/remove-tree! root)))))
+
+(deftest reopen-does-not-recreate-a-schema-directory-removed-after-load-test
+  "If the schema directory vanishes after its history was loaded, nothing
+   recreates it: reopen invents no history."
+  (let [root (scratch)
+        {:keys [schema-directory] :as opts} (options root)
+        original-load schema-store/load-revisions]
+    (try
+      (store/open! (assoc opts :initialize? true))
+      (with-redefs [schema-store/load-revisions
+                    (fn [directory]
+                      (let [result (original-load directory)]
+                        (fs/remove-tree! schema-directory)
+                        result))]
+        (try (store/open! opts) (catch :default _ nil)))
+      (is (not (fs/exists? schema-directory)) "reopen never recreated the schema directory")
+      (finally (fs/remove-tree! root)))))
+
+(defn- evolved-revision []
+  (schema/materialize crypto/sha256 (dissoc lifecycle/catalog :sol.turn/completed)))
+
+(deftest reopen-persists-an-evolved-revision-into-existing-history-test
+  "A source catalog edit still adds its revision on reopen, written only into
+   the existing schema directory."
+  (let [root (scratch)
+        {:keys [schema-directory] :as opts} (options root)
+        evolved (evolved-revision)]
+    (try
+      (store/open! (assoc opts :initialize? true))
+      (let [before (set (fs/list-files schema-directory))]
+        (with-redefs [store/local-revision (delay evolved)]
+          (let [reopened (store/open! opts)]
+            (is (= (:schema/root evolved) (:schema/root (store/current-revision reopened))))
+            (is (= (conj before (str (:schema/root evolved) ".edn"))
+                   (set (fs/list-files schema-directory)))
+                "evolved revision added beside the original history")
+            (is (= #{(:schema/root @(delay (schema/materialize crypto/sha256 lifecycle/catalog)))
+                     (:schema/root evolved)}
+                   (set (map :schema/root (:schema/revisions (:runtime reopened)))))))))
+      (finally (fs/remove-tree! root)))))
+
+(deftest reopen-evolution-refuses-when-schema-directory-vanishes-before-write-test
+  (let [root (scratch)
+        {:keys [schema-directory] :as opts} (options root)
+        original-load schema-store/load-revisions
+        removed? (atom false)]
+    (try
+      (store/open! (assoc opts :initialize? true))
+      (with-redefs [store/local-revision (delay (evolved-revision))
+                    schema-store/load-revisions
+                    (fn [directory]
+                      (let [result (original-load directory)]
+                        (when-not @removed?
+                          (reset! removed? true)
+                          (fs/remove-tree! schema-directory))
+                        result))]
+        (is (thrown? js/Error (store/open! opts))))
+      (is (not (fs/exists? schema-directory))
+          "evolution write never recreates a vanished schema directory")
       (finally (fs/remove-tree! root)))))
 
 (deftest failed-initialization-keeps-a-schema-directory-another-attempt-claimed-test
@@ -411,7 +569,7 @@
     (try
       (store/open! (assoc opts :initialize? true))
       (let [ledger-bytes (fs/read-text ledger-file)]
-        (with-redefs [runtime/open (fn [_ _] (throw (ex-info "reopen failed" {})))]
+        (with-redefs [schema-store/load-revisions (fn [_] (throw (ex-info "reopen failed" {})))]
           (is (thrown-with-msg? cljs.core/ExceptionInfo #"reopen failed" (store/open! opts))))
         (is (= ledger-bytes (fs/read-text ledger-file)))
         (is (fs/exists? schema-directory)))
