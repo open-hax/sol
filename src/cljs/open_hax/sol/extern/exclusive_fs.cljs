@@ -1,10 +1,15 @@
 (ns open-hax.sol.extern.exclusive-fs
-  "Exclusive-create boundary for Clio storage initialization. Raw `node:fs`
-   descriptors stay in this extern namespace; callers receive only paths and
-   an ownership callback."
+  "Clio storage filesystem boundary: exclusive create/rollback and canonical
+   path resolution. Raw `node:fs` descriptors stay in this extern namespace;
+   callers receive only paths and an ownership callback."
   (:require ["node:fs" :as node-fs]
             ["node:path" :as node-path]
             [clojure.string :as str]))
+
+(defn realpath
+  "Resolve symlinks to the canonical absolute path. Throws if `p` is missing."
+  [p]
+  (.realpathSync node-fs (str p)))
 
 (defn create-file!
   "Create an empty file with exclusive (`wx`) semantics, as Clio's

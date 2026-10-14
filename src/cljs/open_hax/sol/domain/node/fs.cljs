@@ -30,11 +30,6 @@
   (try (vec (.readdirSync node-fs (str p)))
        (catch :default _ [])))
 
-(defn realpath
-  "Resolve symlinks to the canonical absolute path. Throws if `p` is missing."
-  [p]
-  (.realpathSync node-fs (str p)))
-
 ;; ── Async ────────────────────────────────────────────────────────────────
 
 (defn read-file!

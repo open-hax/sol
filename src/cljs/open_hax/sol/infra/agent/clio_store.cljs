@@ -6,7 +6,6 @@
             [clio.infra.ledger :as ledger]
             [clio.infra.runtime :as runtime]
             [clojure.string :as str]
-            [open-hax.sol.domain.node.fs :as node-fs]
             [open-hax.sol.domain.node.path :as path]
             [open-hax.sol.extern.exclusive-fs :as exclusive-fs]
             [open-hax.sol.law.lifecycle-catalog :as lifecycle]))
@@ -35,7 +34,7 @@
     (loop [cur resolved
            suffix ()]
       (if (fs/exists? cur)
-        (apply path/join (node-fs/realpath cur) suffix)
+        (apply path/join (exclusive-fs/realpath cur) suffix)
         (let [parent (path/dirname cur)]
           (if (= parent cur)
             resolved
