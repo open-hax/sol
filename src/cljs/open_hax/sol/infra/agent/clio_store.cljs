@@ -200,6 +200,17 @@
    :rolled-back, or nil."
   [ledger-file schema-directory]
   (or (recover-markerless-empty-claim! ledger-file schema-directory)
+      ;; An empty/partial marker (only an older truncate-and-rewrite writer
+      ;; could leave one) is a dead claim too: committed history just loses
+      ;; the marker; an uncommitted claim rolls back with no ledger identity,
+      ;; so an unverifiable ledger is always preserved.
+      (when (and (fs/exists? schema-directory)
+                 (fs/exists? (init-marker-path schema-directory))
+                 (nil? (read-init-marker schema-directory)))
+        (if (seq (schema-edn-revisions schema-directory))
+          (do (clear-init-marker! schema-directory) :resumed)
+          (rollback-incomplete-init! {:ledger-file ledger-file
+                                      :schema-directory schema-directory})))
       (when-let [marker (and (fs/exists? schema-directory)
                              (read-init-marker schema-directory))]
         (cond
