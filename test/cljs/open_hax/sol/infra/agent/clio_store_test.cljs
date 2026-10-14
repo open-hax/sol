@@ -50,6 +50,10 @@
 (def init-marker-name ".sol-clio-init")
 (defn init-marker-path [schema-directory]
   (path/join schema-directory init-marker-name))
+(defn init-lock-path
+  "Sibling init lock: lives beside schema-directory, never inside it."
+  [schema-directory]
+  (str schema-directory ".sol-clio-lock"))
 (defn ^:async promise-rejection [f]
   ;; A container preserves the returned Promise across the async try expression.
   (let [[result] (try
@@ -966,25 +970,27 @@
           "empty incomplete schema claim still released")
       (finally (fs/remove-tree! root)))))
 
-(deftest init-marker-is-locked-before-claim-is-exposed-test
-  "The claim directory is published only after the marker exists: rename onto
-   schema-directory is the expose point, and the schema path is still absent."
+(deftest schema-directory-is-claimed-only-under-the-init-lock-test
+  "The schema directory is created (exclusive mkdir) and marked only while the
+   sibling init lock is held, so recovery can never mistake a live claim for
+   a crashed one. A crash at that point leaves nothing a retry trips over."
   (let [root (scratch)
         {:keys [schema-directory] :as opts} (options root)
-        original-rename exclusive-fs/rename-new!
+        original-create exclusive-fs/create-directory!
         saw (atom nil)]
     (try
-      (with-redefs [exclusive-fs/rename-new!
-                    (fn [from to]
-                      (when (= to schema-directory)
-                        (reset! saw {:marker (fs/exists? (init-marker-path from))
-                                     :exposed? (fs/exists? schema-directory)})
-                        (throw (ex-info "crash before expose" {})))
-                      (original-rename from to))]
-        (is (thrown-with-msg? cljs.core/ExceptionInfo #"crash before expose"
+      (with-redefs [exclusive-fs/create-directory!
+                    (fn [p on-created]
+                      (if (= p schema-directory)
+                        (do (reset! saw {:peer-lock (exclusive-fs/try-lock-file!
+                                                     (init-lock-path schema-directory))})
+                            (exclusive-fs/release-lock! (:peer-lock @saw))
+                            (throw (ex-info "crash at claim" {})))
+                        (original-create p on-created)))]
+        (is (thrown-with-msg? cljs.core/ExceptionInfo #"crash at claim"
               (store/open! (assoc opts :initialize? true)))))
-      (is (true? (:marker @saw)) "marker written before expose")
-      (is (false? (:exposed? @saw)) "schema path not visible before rename")
+      (is (some? @saw) "schema directory claimed through exclusive create")
+      (is (nil? (:peer-lock @saw)) "a peer cannot take the init lock during the claim")
       (is (not (fs/exists? schema-directory)) "claim never exposed")
       (let [canonical-store (store/open! (assoc opts :initialize? true))]
         (is (= [] (store/events canonical-store))))
@@ -1017,4 +1023,107 @@
               (store/reconfigure! config
                                   (assoc config :clio/ledger-file (path/join root "other.edn")))))
         (is (not (fs/exists? (path/join root "other.edn")))))
+      (finally (fs/remove-tree! root)))))
+
+(defn- snapshot-tree
+  "Byte-exact snapshot of every directory and file under root (process-death
+   emulation: what a kill -9 at this instant would leave on disk)."
+  [root]
+  (letfn [(walk [dir]
+            (into [[:dir dir]]
+                  (mapcat (fn [entry]
+                            (let [p (path/join dir (.-name entry))]
+                              (if (.isDirectory entry)
+                                (walk p)
+                                [[:file p (.readFileSync node-fs p)]])))
+                          (.readdirSync node-fs dir #js {:withFileTypes true}))))]
+    (walk root)))
+
+(defn- restore-tree!
+  [root snapshot]
+  (fs/remove-tree! root)
+  (doseq [[kind p bytes] snapshot]
+    (case kind
+      :dir (.mkdirSync node-fs p #js {:recursive true})
+      :file (.writeFileSync node-fs p bytes))))
+
+(deftest process-death-during-marker-phase-update-stays-recoverable-test
+  "Process death while the marker moves to its publishing phase must never
+   leave an empty or partial marker: the next initialize? recovers the claim
+   instead of wedging on a non-fresh schema directory."
+  (let [root (scratch)
+        {:keys [schema-directory] :as opts} (options root)
+        original-open runtime/open
+        original-write (.-writeSync node-fs)
+        opened? (atom false)
+        death (atom nil)]
+    (try
+      (with-redefs [runtime/open (fn [directory catalog]
+                                   (let [result (original-open directory catalog)]
+                                     (reset! opened? true)
+                                     result))]
+        (set! (.-writeSync node-fs)
+              (fn [& args]
+                (if (and @opened? (nil? @death))
+                  (do (reset! death (snapshot-tree root))
+                      (throw (ex-info "process killed during marker update" {})))
+                  (.apply original-write node-fs (into-array args)))))
+        (try
+          (is (thrown-with-msg? cljs.core/ExceptionInfo #"process killed during marker update"
+                (store/open! (assoc opts :initialize? true))))
+          (finally (set! (.-writeSync node-fs) original-write))))
+      (is (some? @death) "death injected during the phase update")
+      (restore-tree! root @death)
+      (is (fs/exists? schema-directory) "claimed schema directory survives the kill")
+      (let [canonical-store (store/open! (assoc opts :initialize? true))]
+        (is (= [] (store/events canonical-store))
+            "restart recovers the interrupted claim and initializes a fresh epoch")
+        (is (not (fs/exists? (init-marker-path schema-directory)))))
+      (finally
+        (set! (.-writeSync node-fs) original-write)
+        (fs/remove-tree! root)))))
+
+(deftest initialization-never-takes-over-a-concurrently-created-schema-directory-test
+  "Another actor creating an empty schema-directory after the freshness check
+   must make this attempt fail; publication never replaces that directory."
+  (let [root (scratch)
+        {:keys [ledger-file schema-directory] :as opts} (options root)
+        original-create exclusive-fs/create-directory!
+        foreign (atom nil)]
+    (try
+      (with-redefs [exclusive-fs/create-directory!
+                    (fn [p on-created]
+                      (when (nil? @foreign)
+                        (fs/ensure-dir! schema-directory)
+                        (reset! foreign (exclusive-fs/file-identity schema-directory)))
+                      (original-create p on-created))]
+        (is (thrown-with-msg? cljs.core/ExceptionInfo #"fresh storage epoch"
+              (store/open! (assoc opts :initialize? true)))))
+      (is (= @foreign (exclusive-fs/file-identity schema-directory))
+          "the concurrently created directory is kept, not replaced")
+      (is (not (fs/exists? ledger-file)) "this attempt never published a ledger")
+      (finally (fs/remove-tree! root)))))
+
+(deftest marker-vanishing-before-lock-acquisition-reopens-the-epoch-test
+  "A concurrent initializer that finishes (and clears its marker) just before
+   recovery takes its lock is a completed race, not a startup failure."
+  (let [root (scratch)
+        {:keys [ledger-file schema-directory] :as opts} (options root)
+        original-lock exclusive-fs/lock-file!
+        original-try-lock exclusive-fs/try-lock-file!
+        peer-finishes! #(fs/delete-if-exists! (init-marker-path schema-directory))]
+    (try
+      (store/open! (assoc opts :initialize? true))
+      ;; The peer is about to clear its marker on a committed epoch.
+      (fs/write-text! (init-marker-path schema-directory)
+                      (str (pr-str {:sol.clio/init-pending true
+                                    :phase :publishing
+                                    :ledger-file ledger-file
+                                    :schema-directory schema-directory})
+                           "\n"))
+      (with-redefs [exclusive-fs/lock-file! (fn [p] (peer-finishes!) (original-lock p))
+                    exclusive-fs/try-lock-file! (fn [p] (peer-finishes!) (original-try-lock p))]
+        (let [canonical-store (store/open! (assoc opts :initialize? true))]
+          (is (= [] (store/events canonical-store))
+              "initialize? reopens the epoch the peer just committed")))
       (finally (fs/remove-tree! root)))))
