@@ -5,6 +5,7 @@
             [clio.extern.js.fs :as fs]
             [clio.infra.ledger :as ledger]
             [clio.infra.runtime :as runtime]
+            [clio.infra.schema-store :as schema-store]
             [clojure.string :as str]
             [open-hax.sol.domain.node.path :as path]
             [open-hax.sol.extern.exclusive-fs :as exclusive-fs]
@@ -56,6 +57,120 @@
          (not (path/absolute? rel))
          (not (some #(= ".." %) (str/split rel #"[\\/]"))))))
 
+(defn- missing-schema-history! []
+  (throw (ex-info "Explicit Clio schema history is missing" {})))
+
+(defn- has-root? [revisions root]
+  (boolean (some #(= root (:schema/root %)) revisions)))
+
+(defn- persist-evolved-revision!
+  "Add the current revision to existing schema history without creating any
+   directory. Same snapshot bytes as Clio's schema-store/ensure-revision!, but
+   written through an exclusive create inside the already-existing directory:
+   a directory that vanished fails ENOENT instead of being recreated. A
+   concurrent opener publishing the same root first is accepted; the reload
+   that follows verifies every snapshot against its recorded root."
+  [schema-directory revision]
+  (let [root (:schema/root revision)
+        target (schema-store/revision-path schema-directory root)
+        staging (str target ".tmp-" (random-uuid))
+        staged? (atom false)
+        snapshot {:schema/root root :schema/catalog (:schema/catalog revision)}]
+    (try
+      (exclusive-fs/write-new-file! staging (str (pr-str snapshot) "\n") #(reset! staged? true))
+      (try
+        (exclusive-fs/link-new! staging target)
+        (catch :default error
+          (when-not (= "EEXIST" (.-code error)) (throw error))))
+      (finally
+        (when @staged? (attempt-cleanup! #(fs/delete-if-exists! staging)))))))
+
+(defn- reopen-runtime
+  "Ordinary reopen loads schema history through non-creating operations only.
+   runtime/open (and ensure-revision!) recursively create the directory, so a
+   directory removed after validation would be silently re-materialized with
+   only the current revision; this never calls them. Missing or empty history
+   refuses. A source catalog edit still adds its revision, written only into
+   the existing directory."
+  [schema-directory]
+  (let [current @local-revision
+        root (:schema/root current)
+        persisted (schema-store/load-revisions schema-directory)]
+    (when (empty? persisted) (missing-schema-history!))
+    (let [revisions (if (has-root? persisted root)
+                      persisted
+                      (do (persist-evolved-revision! schema-directory current)
+                          (schema-store/load-revisions schema-directory)))]
+      (when-not (has-root? revisions root) (missing-schema-history!))
+      {:schema/directory schema-directory
+       :schema/current current
+       :schema/revisions revisions})))
+
+(defn- initialize!
+  "Create a fresh storage epoch with atomic ledger ownership. The schema
+   directory is claimed by exclusive mkdir. The ledger is created under a
+   private staging name beside the target and published with an exclusive
+   hard link only after runtime/open and canonicalization succeed. Until that
+   publish nothing exists at the ledger path, so no concurrent reopen can adopt
+   or append to a ledger this attempt might roll back; after it, the epoch is
+   committed and nothing is unlinked except the staging alias. Publishing
+   fails EEXIST if another attempt won the ledger path, and rollback removes
+   only this attempt's staging file and owned schema artifacts. The schema
+   directory is only adoptable by a reopen that names a ledger this attempt
+   never published, so rolling it back cannot strand accepted history."
+  [ledger-file schema-directory]
+  (when (or (fs/exists? ledger-file) (fs/exists? schema-directory))
+    (throw (ex-info "Clio initialization requires a fresh storage epoch" {})))
+  ;; Nested ledger/schema layouts are refused before creating anything:
+  ;; schema under the ledger path leaves a directory at the ledger on
+  ;; failure; ledger under the schema path is treated as a schema
+  ;; snapshot by runtime and makes the store unusable.
+  (when (or (path-beneath? ledger-file schema-directory)
+            (path-beneath? schema-directory ledger-file)
+            (= (canonical-path ledger-file) (canonical-path schema-directory)))
+    (throw (ex-info
+            "Clio ledger file and schema directory must not nest"
+            {:ledger-file ledger-file :schema-directory schema-directory})))
+  (let [staging (str ledger-file ".init-" (random-uuid))
+        staging-created? (atom false)
+        schema-created? (atom false)]
+    (try
+      ;; Claim the schema directory before creating the ledger parent or
+      ;; staging file so exclusive mkdir owns the directory even when a later
+      ;; step fails.
+      (fs/ensure-dir! (path/dirname schema-directory))
+      (exclusive-fs/create-directory! schema-directory #(reset! schema-created? true))
+      (fs/ensure-dir! (path/dirname ledger-file))
+      ;; Ownership is recorded as soon as the exclusive open succeeds, so a
+      ;; failing descriptor close still rolls the staging file back.
+      (exclusive-fs/create-file! staging #(reset! staging-created? true))
+      (let [runtime (runtime/open schema-directory lifecycle/catalog)
+            _ (ledger/canonicalize-files (:schema/revisions runtime) [staging])]
+        (exclusive-fs/link-new! staging ledger-file)
+        ;; Committed: the ledger path now names this epoch. Only the private
+        ;; staging alias remains to drop; its failure cannot undo the commit.
+        (reset! schema-created? false)
+        (attempt-cleanup! #(fs/delete-if-exists! staging))
+        (reset! staging-created? false)
+        {:runtime runtime :ledger-file ledger-file :schema-directory schema-directory})
+      (catch :default error
+        (when @staging-created?
+          (attempt-cleanup! #(fs/delete-if-exists! staging)))
+        (when @schema-created?
+          (attempt-cleanup!
+           #(exclusive-fs/rollback-owned-directory!
+             schema-directory
+             [(schema-store/revision-path schema-directory (:schema/root @local-revision))])))
+        (throw error)))))
+
+(defn- reopen!
+  [ledger-file schema-directory]
+  ;; Upstream refuses deleted/misspelled paths instead of inventing history.
+  (ledger/read-ledgers [ledger-file])
+  (let [runtime (reopen-runtime schema-directory)]
+    (ledger/canonicalize-files (:schema/revisions runtime) [ledger-file])
+    {:runtime runtime :ledger-file ledger-file :schema-directory schema-directory}))
+
 (defn open!
   "Open explicitly named complete Clio history. Initialization requires new
    ledger/schema paths and is separate from ordinary append/reopen. A failed
@@ -66,73 +181,9 @@
                        [:schema-directory schema-directory]]]
     (when (or (not (string? value)) (str/blank? value))
       (throw (ex-info "Explicit Clio filesystem paths required" {:path/key label}))))
-  (let [schema-preexisting? (fs/exists? schema-directory)
-        ledger-created? (atom false)
-        schema-created? (atom false)]
-    (try
-      (if initialize?
-        (do
-          (when (or (fs/exists? ledger-file) schema-preexisting?)
-            (throw (ex-info "Clio initialization requires a fresh storage epoch" {})))
-          ;; Nested ledger/schema layouts are refused before creating anything:
-          ;; schema under the ledger path leaves a directory at the ledger on
-          ;; failure; ledger under the schema path is treated as a schema
-          ;; snapshot by runtime and makes the store unusable.
-          (when (or (path-beneath? ledger-file schema-directory)
-                    (path-beneath? schema-directory ledger-file)
-                    (= (canonical-path ledger-file) (canonical-path schema-directory)))
-            (throw (ex-info
-                    "Clio ledger file and schema directory must not nest"
-                    {:ledger-file ledger-file :schema-directory schema-directory})))
-          ;; Claim the schema directory before creating the ledger parent or
-          ;; file so exclusive mkdir owns the directory even when a later step
-          ;; fails.
-          (fs/ensure-dir! (path/dirname schema-directory))
-          (exclusive-fs/create-directory! schema-directory #(reset! schema-created? true))
-          (fs/ensure-dir! (path/dirname ledger-file))
-          ;; Same empty exclusive file as ledger/create-ledger!, but ownership
-          ;; is recorded as soon as the exclusive open succeeds, so a failing
-          ;; descriptor close still rolls the new ledger back. An exclusive-open
-          ;; failure never claims (or deletes) a file another attempt created.
-          (exclusive-fs/create-file! ledger-file #(reset! ledger-created? true)))
-        (do
-          ;; Upstream refuses deleted/misspelled paths instead of inventing history.
-          (ledger/read-ledgers [ledger-file])
-          ;; Reopening is not initialization, including a missing schema history.
-          ;; Recheck after the ledger read: a directory that vanished mid-read
-          ;; must still refuse rather than letting runtime/open recreate it.
-          (when-not (fs/exists? schema-directory)
-            (throw (ex-info "Explicit Clio schema history is missing" {})))
-          ;; An empty schema directory is also missing history: runtime/open
-          ;; would silently materialize the current revision and report ready.
-          (when (exclusive-fs/directory-empty? schema-directory)
-            (throw (ex-info "Explicit Clio schema history is missing" {})))))
-      ;; Precompute the revision path this attempt will persist so rollback
-      ;; deletes only that artifact, never a concurrent child under the schema
-      ;; directory. Hold the initialization claim until commit succeeds so a
-      ;; concurrent reopen that began using the new ledger cannot have its
-      ;; accepted history unlinked on failure.
-      (let [runtime (runtime/open schema-directory lifecycle/catalog)
-            _ (ledger/canonicalize-files (:schema/revisions runtime) [ledger-file])
-            committed {:runtime runtime :ledger-file ledger-file :schema-directory schema-directory}]
-        (reset! ledger-created? false)
-        (reset! schema-created? false)
-        committed)
-      (catch :default error
-        ;; Only unlink artifacts we still exclusively own. If another process
-        ;; reopened and appended during runtime/open, the ledger is non-empty —
-        ;; leave both ledger and schema so their accepted history stays reopenable.
-        (let [still-private?
-              (or (not (fs/exists? ledger-file))
-                  (exclusive-fs/empty-regular-file? ledger-file))]
-          (when (and @ledger-created? still-private?)
-            (attempt-cleanup! #(fs/delete-if-exists! ledger-file)))
-          (when (and @schema-created? still-private?)
-            (attempt-cleanup!
-             #(exclusive-fs/rollback-owned-directory!
-               schema-directory
-               [(str schema-directory "/" (:schema/root @local-revision) ".edn")]))))
-        (throw error)))))
+  (if initialize?
+    (initialize! ledger-file schema-directory)
+    (reopen! ledger-file schema-directory)))
 
 (defn append!
   "Delegate exact-event admission to Clio; preserve constructed data on retries."

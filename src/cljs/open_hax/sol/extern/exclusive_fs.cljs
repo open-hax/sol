@@ -40,21 +40,27 @@
       (when (.isFile st)
         (.unlinkSync node-fs (str p))))))
 
-(defn directory-empty?
-  "True when p exists as a directory with no entries."
-  [p]
-  (and (.existsSync node-fs (str p))
-       (.isDirectory (.lstatSync node-fs (str p)))
-       (zero? (alength (.readdirSync node-fs (str p))))))
+(defn link-new!
+  "Publish `from` at `to` with exclusive semantics: a hard link (`link(2)`)
+   fails EEXIST rather than replacing a file another process already owns
+   there, unlike rename. Both paths name the same inode afterwards. Returns to."
+  [from to]
+  (.linkSync node-fs (str from) (str to))
+  to)
 
-(defn empty-regular-file?
-  "True when p exists as a regular file of size 0. Used so initialization
-   rollback does not unlink a ledger another process has already appended to."
-  [p]
-  (boolean
-   (when (.existsSync node-fs (str p))
-     (let [st (.lstatSync node-fs (str p))]
-       (and (.isFile st) (zero? (.-size st)))))))
+(defn write-new-file!
+  "Write `text` to a new file at p with exclusive (`wx`) semantics. Never
+   creates parent directories: a vanished parent fails ENOENT instead of being
+   recreated. The caller owns p once this returns or throws after the open."
+  [p text on-created]
+  (let [fd (.openSync node-fs (str p) "wx")]
+    (try
+      (on-created)
+      (.writeSync node-fs fd (str text))
+      (.fsyncSync node-fs fd)
+      (finally
+        (.closeSync node-fs fd))))
+  p)
 
 (defn rollback-owned-directory!
   "Remove only `owned-files` under p, then the directory itself when empty.
@@ -71,3 +77,4 @@
         (.rmdirSync node-fs root)
         (catch :default _ nil))))
   p)
+
