@@ -608,8 +608,9 @@
           (when staging-ledger
             (fs/write-text! (path/join (path/dirname ledger-file) staging-ledger)
                             staging-ledger-bytes))
-          (let [canonical-store (store/open! opts)]
-            (is (= [] (store/events canonical-store)) "reopen resumes the incomplete epoch")
+          (let [canonical-store (store/open! (assoc opts :initialize? true))]
+            (is (= [] (store/events canonical-store))
+                "initialize? after resume reopens the committed epoch")
             (is (not (fs/exists? (init-marker-path schema-directory))) "marker cleared after resume")
             (is (seq (visible-revisions schema-directory)) "schema revision published")
             (is (= [] (staging-leftovers ledger-file)))
@@ -618,20 +619,25 @@
 
 (deftest process-death-without-staging-rolls-back-via-marker-test
   "If staging is gone after process death, the marker still identifies an
-   incomplete epoch so startup can roll it back and initialize fresh."
+   incomplete epoch so startup can roll it back and initialize fresh. The
+   ledger is deleted only when its inode matches the marker identity."
   (let [root (scratch)
-        {:keys [ledger-file schema-directory] :as opts} (options root)
-        marker (pr-str {:sol.clio/init-pending true
-                        :ledger-file ledger-file
-                        :schema-directory schema-directory
-                        :staging-ledger (str ledger-file ".init-dead")
-                        :staging-schema (str schema-directory ".init-dead")
-                        :schema/root "deadroot"})]
+        {:keys [ledger-file schema-directory] :as opts} (options root)]
     (try
       (fs/ensure-dir! (path/dirname ledger-file))
       (fs/write-text! ledger-file "")
       (fs/ensure-dir! schema-directory)
-      (fs/write-text! (init-marker-path schema-directory) marker)
+      (fs/write-text! (init-marker-path schema-directory)
+                      (str (pr-str {:sol.clio/init-pending true
+                                    :phase :publishing
+                                    :ledger-file ledger-file
+                                    :schema-directory schema-directory
+                                    :staging-ledger (str ledger-file ".init-dead")
+                                    :staging-schema (str schema-directory ".init-dead")
+                                    :schema/root "deadroot"
+                                    :ledger-identity (exclusive-fs/file-identity ledger-file)})
+                           "
+"))
       (let [canonical-store (store/open! (assoc opts :initialize? true))]
         (is (= [] (store/events canonical-store))
             "initialize rolls back the incomplete epoch then creates a fresh one")
@@ -770,6 +776,9 @@
         (let [created (atom false)]
           (with-redefs [exclusive-fs/create-directory!
                         (fn [p on-created]
+                          ;; Real create-directory! mkdirs; keep that so the
+                          ;; immediate init marker write has a home.
+                          (.mkdirSync node-fs (str p))
                           (reset! created true)
                           (on-created)
                           p)
@@ -885,6 +894,94 @@
         (await (episode/emit! e :sol.run/failed {:error "start acknowledgement lost"}))
         (is (= [:sol.run/started :sol.run/failed] (mapv :event/type (store/events canonical-store))))
         (is (= [1 2] (mapv :event/seq (store/events canonical-store)))))
+      (finally (fs/remove-tree! root)))))
+
+
+(deftest resume-requires-published-ledger-owned-by-marker-test
+  "Recovery must not publish the staged schema while the live initializer has
+   not yet linked the ledger: that races the owner and can strand a schema
+   revision with no usable ledger."
+  (let [root (scratch)
+        {:keys [ledger-file schema-directory] :as opts} (options root)
+        staging-schema (str schema-directory ".init-peer")
+        root-id "abc"
+        revision (path/join staging-schema (str root-id ".edn"))]
+    (try
+      (fs/ensure-dir! schema-directory)
+      (fs/ensure-dir! staging-schema)
+      (fs/write-text! revision "{:schema/root \"abc\" :schema/catalog {}}\n")
+      (fs/write-text! (init-marker-path schema-directory)
+                      (str (pr-str {:sol.clio/init-pending true
+                                    :phase :publishing
+                                    :ledger-file ledger-file
+                                    :schema-directory schema-directory
+                                    :staging-ledger (str ledger-file ".init-peer")
+                                    :staging-schema staging-schema
+                                    :schema/root root-id
+                                    ;; No ledger-identity and no ledger file:
+                                    ;; resume must refuse.
+                                    })
+                           "\n"))
+      (let [canonical-store (store/open! (assoc opts :initialize? true))]
+        (is (= [] (store/events canonical-store))
+            "without a published ledger, recovery rolls back then initializes fresh")
+        (is (not (fs/exists? staging-schema))
+            "peer staging removed rather than resumed into the claim")
+        (is (not (fs/exists? (init-marker-path schema-directory)))))
+      (finally (fs/remove-tree! root)))))
+
+(deftest rollback-preserves-ledger-when-inode-does-not-match-marker-test
+  ;; A stale marker must not delete a newer initializer's ledger at the same path.
+  (let [root (scratch)
+        {:keys [ledger-file schema-directory] :as opts} (options root)
+        foreign "foreign-epoch\n"]
+    (try
+      (fs/ensure-dir! (path/dirname ledger-file))
+      (fs/write-text! ledger-file foreign)
+      (fs/ensure-dir! schema-directory)
+      (fs/write-text! (init-marker-path schema-directory)
+                      (str (pr-str {:sol.clio/init-pending true
+                                    :phase :publishing
+                                    :ledger-file ledger-file
+                                    :schema-directory schema-directory
+                                    :staging-ledger (str ledger-file ".init-stale")
+                                    :staging-schema (str schema-directory ".init-stale")
+                                    :schema/root "stale"
+                                    ;; Deliberately wrong identity.
+                                    :ledger-identity {:dev -1 :ino -1}})
+                           "\n"))
+      (is (thrown-with-msg? cljs.core/ExceptionInfo #"fresh storage epoch"
+            (store/open! (assoc opts :initialize? true))))
+      (is (= foreign (fs/read-text ledger-file))
+          "foreign ledger at the marker path is preserved")
+      (is (not (fs/exists? schema-directory))
+          "empty incomplete schema claim still released")
+      (finally (fs/remove-tree! root)))))
+
+(deftest init-marker-is-written-immediately-after-schema-claim-test
+  "Crash after exclusive mkdir but before staging must leave a recoverable
+   marker (or a markerless empty claim that recovery removes)."
+  (let [root (scratch)
+        {:keys [schema-directory] :as opts} (options root)
+        original-create exclusive-fs/create-directory!
+        saw-marker (atom false)]
+    (try
+      (with-redefs [exclusive-fs/create-directory!
+                    (fn [p on-created]
+                      (let [result (original-create p on-created)]
+                        (when (= p schema-directory)
+                          (reset! saw-marker
+                                  (fs/exists? (init-marker-path schema-directory)))
+                          (throw (ex-info "crash after claim" {})))
+                        result))]
+        (is (thrown-with-msg? cljs.core/ExceptionInfo #"crash after claim"
+              (store/open! (assoc opts :initialize? true)))))
+      (is (true? @saw-marker)
+          "marker exists before any staging work")
+      (is (not (fs/exists? schema-directory))
+          "failed attempt rolled the claim back")
+      (let [canonical-store (store/open! (assoc opts :initialize? true))]
+        (is (= [] (store/events canonical-store))))
       (finally (fs/remove-tree! root)))))
 
 (deftest hot-reload-reuses-transport-and-refuses-path-change-test
