@@ -3,6 +3,7 @@
    path resolution. Raw `node:fs` descriptors stay in this extern namespace;
    callers receive only paths and an ownership callback."
   (:require ["node:fs" :as node-fs]
+            ["node:path" :as node-path]
             ["fs-ext-extra-prebuilt" :as fse]))
 
 (defn realpath
@@ -26,11 +27,20 @@
 
 (defn create-directory!
   "Create one directory exclusively (non-recursive `mkdir`): the parent must
-   already exist and an existing directory throws EEXIST without calling
-   `on-created`. `on-created` runs only once this call has created the
-   directory, so the caller can roll back exactly what it owns. Returns p."
+   already exist and an existing path (even an empty directory) fails without
+   calling `on-created`. EEXIST is shaped as `{:exclusive-fs/error
+   :already-exists}` so callers never read Node `.code`. `on-created` runs
+   only once this call has created the directory, so the caller can roll back
+   exactly what it owns. Returns p."
   [p on-created]
-  (.mkdirSync node-fs (str p))
+  (try
+    (.mkdirSync node-fs (str p))
+    (catch :default error
+      (if (= "EEXIST" (.-code error))
+        (throw (ex-info "Exclusive directory target already exists"
+                        {:exclusive-fs/error :already-exists
+                         :path (str p)}))
+        (throw error))))
   (on-created)
   p)
 
@@ -103,12 +113,13 @@
     (boolean (and ia ib (= ia ib)))))
 
 (defn try-lock-file!
-  "Non-blocking exclusive flock on an existing file. Returns an opaque lock
-   handle, or nil when another process holds the lock (EAGAIN/EWOULDBLOCK).
-   Caller must release-lock!."
+  "Non-blocking exclusive flock on the lock file at p, creating it (never
+   truncating) when missing, so a lock path never fails ENOENT. Returns an
+   opaque lock handle, or nil when another holder has the lock
+   (EAGAIN/EWOULDBLOCK). Caller must release-lock!."
   [p]
   (let [constants (.-constants fse)
-        fd (.openSync node-fs (str p) "r+")]
+        fd (.openSync node-fs (str p) "a")]
     (try
       (.flockSync fse fd (bit-or (.-LOCK_EX constants) (.-LOCK_NB constants)))
       {:fd fd :path (str p)}
@@ -120,10 +131,13 @@
             (throw error)))))))
 
 (defn lock-file!
-  "Blocking exclusive flock on an existing file. Returns an opaque lock handle."
+  "Blocking exclusive flock on the lock file at p, creating it (never
+   truncating) when missing. Lock files are permanent: deleting one would let
+   a later opener lock a different inode than a current holder. Returns an
+   opaque lock handle; caller must release-lock!."
   [p]
   (let [constants (.-constants fse)
-        fd (.openSync node-fs (str p) "r+")]
+        fd (.openSync node-fs (str p) "a")]
     (try
       (.flockSync fse fd (.-LOCK_EX constants))
       {:fd fd :path (str p)}
@@ -141,43 +155,26 @@
       (try (.closeSync node-fs fd) (catch :default _ nil)))))
 
 
-(defn rename-new!
-  "Atomically rename `from` to `to`. Fails if `to` already exists (no replace).
-   Used to publish a privately prepared claim directory."
-  [from to]
+(defn- fsync-directory!
+  "Best-effort durability for a rename inside dir (POSIX); hosts that cannot
+   open a directory skip it."
+  [dir]
   (try
-    (.renameSync node-fs (str from) (str to))
-    (catch :default error
-      (let [code (.-code error)]
-        (if (or (= "EEXIST" code) (= "ENOTEMPTY" code) (= "EBUSY" code))
-          (throw (ex-info "Exclusive rename target already exists"
-                          {:exclusive-fs/error :already-exists
-                           :path (str to)}))
-          (throw error)))))
-  to)
+    (let [fd (.openSync node-fs (str dir) "r")]
+      (try (.fsyncSync node-fs fd) (finally (.closeSync node-fs fd))))
+    (catch :default _ nil)))
 
-(defn write-file-atomic!
-  "Create `p` with complete `text` via exclusive create (wx). For the first
-   marker write only; later updates must use rewrite-file-in-place! so a held
-   flock keeps the same inode."
+(defn replace-file!
+  "Crash-atomically set p to the complete `text`: write and fsync a private
+   sibling `<p>.tmp`, then rename it over p. A reader (or a restart after
+   process death) sees either the previous complete file or the new one,
+   never an empty or partial body. A leftover `<p>.tmp` from an earlier death
+   is discarded first; callers serialize writers with an external lock.
+   Returns p."
   [p text]
-  (write-new-file! p text (fn [] nil))
+  (let [tmp (str p ".tmp")]
+    (try (.unlinkSync node-fs tmp) (catch :default _ nil))
+    (write-new-file! tmp text (fn [] nil))
+    (.renameSync node-fs tmp (str p))
+    (fsync-directory! (.dirname node-path (str p))))
   p)
-
-(defn rewrite-file-in-place!
-  "Overwrite the locked file's contents through its open fd, preserving the
-   inode so an exclusive flock remains valid."
-  [lock text]
-  (let [fd (:fd lock)
-        bytes (.from js/Buffer (str text) "utf8")
-        total (.-length bytes)]
-    (.ftruncateSync node-fs fd 0)
-    (loop [offset 0]
-      (when (< offset total)
-        (let [written (.writeSync node-fs fd bytes offset (- total offset))]
-          (when-not (pos? written)
-            (throw (ex-info "File write made no progress"
-                            {:path (:path lock) :offset offset})))
-          (recur (+ offset written)))))
-    (.fsyncSync node-fs fd))
-  (:path lock))
