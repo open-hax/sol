@@ -319,7 +319,7 @@
                     (fn [from to]
                       (fs/write-text! to other)
                       (original-link from to))]
-        (is (thrown-with-msg? js/Error #"EEXIST"
+        (is (thrown-with-msg? cljs.core/ExceptionInfo #"already exists"
               (store/open! (assoc opts :initialize? true)))))
       (is (= other (fs/read-text ledger-file)) "the other attempt's ledger is kept")
       (is (= [] (staging-leftovers ledger-file)) "this attempt's staging file removed")
@@ -403,7 +403,7 @@
                                      (catch :default e (.-message e))))
                         (fs/write-text! ledger-file competing))
                       (original-link from to))]
-        (is (thrown-with-msg? js/Error #"EEXIST"
+        (is (thrown-with-msg? cljs.core/ExceptionInfo #"already exists"
               (store/open! (assoc opts :initialize? true)))))
       (is (= [] @visible-at-publish) "no schema revision is visible before the ledger commits")
       (is (some->> @adopt-error (re-find #"schema history"))

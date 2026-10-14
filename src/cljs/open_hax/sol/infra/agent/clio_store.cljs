@@ -1,6 +1,7 @@
 (ns open-hax.sol.infra.agent.clio-store
   "Opt-in Clio filesystem transport. No history migration or durable-ack claim."
-  (:require [clio.domain.schema :as schema]
+  (:require [cljs.reader :as reader]
+            [clio.domain.schema :as schema]
             [clio.extern.js.crypto :as crypto]
             [clio.extern.js.fs :as fs]
             [clio.infra.ledger :as ledger]
@@ -57,6 +58,103 @@
          (not (path/absolute? rel))
          (not (some #(= ".." %) (str/split rel #"[\\/]"))))))
 
+
+(def ^:private init-marker-name ".sol-clio-init")
+
+(defn- init-marker-path
+  [schema-directory]
+  (path/join schema-directory init-marker-name))
+
+(defn- write-init-marker!
+  "Durable record that an initialization publish is in flight. Survives
+   process death between the ledger link and the schema revision link."
+  [schema-directory marker]
+  (fs/write-text! (init-marker-path schema-directory) (str (pr-str marker) "\n")))
+
+(defn- clear-init-marker!
+  [schema-directory]
+  (attempt-cleanup! #(fs/delete-if-exists! (init-marker-path schema-directory))))
+
+(defn- read-init-marker
+  "Return the pending-init map when present and well-formed; otherwise nil."
+  [schema-directory]
+  (let [marker (init-marker-path schema-directory)]
+    (when (fs/exists? marker)
+      (try
+        (let [data (reader/read-string (fs/read-text marker))]
+          (when (and (map? data) (true? (:sol.clio/init-pending data)))
+            data))
+        (catch :default _ nil)))))
+
+(defn- schema-edn-revisions
+  "Revision snapshot basenames (exclude the init marker)."
+  [schema-directory]
+  (filterv #(str/ends-with? % ".edn") (fs/list-files schema-directory)))
+
+(defn- rollback-incomplete-init!
+  "Release an incomplete epoch identified by its marker. Safe only while the
+   schema directory holds no revision snapshots: no reopen can have adopted
+   it. Deletes the published ledger named by the marker, clears staging
+   leftovers, removes the marker, and rmdirs the empty schema directory."
+  [{:keys [ledger-file schema-directory staging-ledger staging-schema]}]
+  (when (and schema-directory (fs/exists? schema-directory)
+             (empty? (schema-edn-revisions schema-directory)))
+    (when ledger-file
+      (attempt-cleanup! #(fs/delete-if-exists! ledger-file)))
+    (when staging-ledger
+      (attempt-cleanup! #(fs/delete-if-exists! staging-ledger)))
+    (when staging-schema
+      (attempt-cleanup! #(fs/remove-tree! staging-schema)))
+    (clear-init-marker! schema-directory)
+    (attempt-cleanup! #(exclusive-fs/remove-directory-if-empty! schema-directory))))
+
+(defn- resume-incomplete-init!
+  "Finish a publish interrupted after the ledger link: link the staged
+   revision into the claimed directory (the original commit point), clear
+   the marker, and drop private staging. Returns true when resumed."
+  [{:keys [schema-directory staging-schema] root :schema/root :as marker}]
+  (let [staging-revision (when (and staging-schema root)
+                           (schema-store/revision-path staging-schema root))
+        target (when root (schema-store/revision-path schema-directory root))]
+    (when (and staging-revision target (fs/exists? staging-revision)
+               (empty? (schema-edn-revisions schema-directory)))
+      (try
+        (exclusive-fs/link-new! staging-revision target)
+        (catch :default error
+          (when-not (= :already-exists (:exclusive-fs/error (ex-data error)))
+            (throw error))))
+      (clear-init-marker! schema-directory)
+      (when-let [staging-ledger (:staging-ledger marker)]
+        (attempt-cleanup! #(fs/delete-if-exists! staging-ledger)))
+      (attempt-cleanup! #(fs/remove-tree! staging-schema))
+      true)))
+
+(defn- recover-incomplete-initialization!
+  "If a prior attempt left a durable init marker, resume when staging still
+   holds the revision; otherwise roll the incomplete epoch back so initialize
+   or reopen can proceed. A marker with an already-published revision is
+   treated as committed and only clears leftovers."
+  [ledger-file schema-directory]
+  (when-let [marker (and (fs/exists? schema-directory) (read-init-marker schema-directory))]
+    (cond
+      ;; Marker paths must name this open request's locations.
+      (not (and (= ledger-file (:ledger-file marker))
+                (= schema-directory (:schema-directory marker))))
+      nil
+
+      (seq (schema-edn-revisions schema-directory))
+      (do (clear-init-marker! schema-directory)
+          (when-let [staging-ledger (:staging-ledger marker)]
+            (attempt-cleanup! #(fs/delete-if-exists! staging-ledger)))
+          (when-let [staging-schema (:staging-schema marker)]
+            (attempt-cleanup! #(fs/remove-tree! staging-schema))))
+
+      (resume-incomplete-init! marker)
+      nil
+
+      :else
+      (rollback-incomplete-init! marker))))
+
 (defn- missing-schema-history! []
   (throw (ex-info "Explicit Clio schema history is missing" {})))
 
@@ -83,7 +181,8 @@
       (try
         (exclusive-fs/link-new! staging target)
         (catch :default error
-          (when-not (= "EEXIST" (.-code error)) (throw error))))
+          (when-not (= :already-exists (:exclusive-fs/error (ex-data error)))
+            (throw error))))
       (finally
         (when @staged? (attempt-cleanup! #(fs/delete-if-exists! staging)))))))
 
@@ -114,14 +213,17 @@
    reopen (of this or any other ledger) can adopt it: empty history refuses.
    runtime/open materializes the revision into a private staging directory
    and the ledger is created under a private staging name; canonicalization
-   runs against both. Publishing is two exclusive hard links: first the
-   ledger (EEXIST if another attempt won the path), then the revision into
-   the claimed directory, which is the commit point. Before that second link
-   the claimed directory holds no revision, so no process can have opened the
-   published ledger or relied on the directory, and rollback may release them:
-   it unlinks only staging names and a ledger this attempt published, and
-   removes the claimed directory only with non-recursive rmdir, which fails
-   (and keeps it) once anything else lives there."
+   runs against both. A durable `.sol-clio-init` marker is written before
+   publish so process death between the two links is recoverable: the next
+   open resumes from staging or rolls the incomplete epoch back. Publishing
+   is two exclusive hard links: first the ledger (already-exists if another
+   attempt won the path), then the revision into the claimed directory, which
+   is the commit point. Before that second link the claimed directory holds
+   no revision, so no process can have opened the published ledger or relied
+   on the directory, and rollback may release them: it unlinks only staging
+   names and a ledger this attempt published, and removes the claimed
+   directory only with non-recursive rmdir, which fails (and keeps it) once
+   anything else lives there."
   [ledger-file schema-directory]
   (when (or (fs/exists? ledger-file) (fs/exists? schema-directory))
     (throw (ex-info "Clio initialization requires a fresh storage epoch" {})))
@@ -155,13 +257,23 @@
       (exclusive-fs/create-file! staging-ledger #(reset! staging-ledger? true))
       (let [staged (runtime/open staging-schema lifecycle/catalog)
             root (:schema/root (:schema/current staged))
-            _ (ledger/canonicalize-files (:schema/revisions staged) [staging-ledger])]
+            _ (ledger/canonicalize-files (:schema/revisions staged) [staging-ledger])
+            marker {:sol.clio/init-pending true
+                    :ledger-file ledger-file
+                    :schema-directory schema-directory
+                    :staging-ledger staging-ledger
+                    :staging-schema staging-schema
+                    :schema/root root}]
+        ;; Marker before any publish: process death after the ledger link
+        ;; leaves enough to resume or roll back on the next open.
+        (write-init-marker! schema-directory marker)
         (exclusive-fs/link-new! staging-ledger ledger-file)
         (reset! ledger-published? true)
         (exclusive-fs/link-new! (schema-store/revision-path staging-schema root)
                                 (schema-store/revision-path schema-directory root))
-        ;; Committed. Only private staging aliases remain to drop; their
-        ;; failure cannot undo the commit.
+        ;; Committed. Clear the marker, then drop private staging aliases;
+        ;; their failure cannot undo the commit.
+        (clear-init-marker! schema-directory)
         (reset! schema-claimed? false)
         (reset! ledger-published? false)
         (attempt-cleanup! #(fs/delete-if-exists! staging-ledger))
@@ -179,6 +291,7 @@
         (when @staging-schema?
           (attempt-cleanup! #(fs/remove-tree! staging-schema)))
         (when @schema-claimed?
+          (clear-init-marker! schema-directory)
           (attempt-cleanup! #(exclusive-fs/remove-directory-if-empty! schema-directory)))
         (throw error)))))
 
@@ -194,12 +307,15 @@
   "Open explicitly named complete Clio history. Initialization requires new
    ledger/schema paths and is separate from ordinary append/reopen. A failed
    initialization removes only the artifacts this attempt created, so a retry
-   still sees a fresh storage epoch."
+   still sees a fresh storage epoch. Before either mode, recover any incomplete
+   initialization left by process death (resume from the durable marker, or
+   roll the unadoptable epoch back)."
   [{:keys [ledger-file schema-directory initialize?]}]
   (doseq [[label value] [[:ledger-file ledger-file]
                        [:schema-directory schema-directory]]]
     (when (or (not (string? value)) (str/blank? value))
       (throw (ex-info "Explicit Clio filesystem paths required" {:path/key label}))))
+  (recover-incomplete-initialization! ledger-file schema-directory)
   (if initialize?
     (initialize! ledger-file schema-directory)
     (reopen! ledger-file schema-directory)))

@@ -35,10 +35,20 @@
 
 (defn link-new!
   "Publish `from` at `to` with exclusive semantics: a hard link (`link(2)`)
-   fails EEXIST rather than replacing a file another process already owns
-   there, unlike rename. Both paths name the same inode afterwards. Returns to."
+   fails rather than replacing a file another process already owns there,
+   unlike rename. Both paths name the same inode afterwards. EEXIST is
+   classified here as shaped Clojure data (`{:exclusive-fs/error
+   :already-exists}`) so callers above extern never read Node `.code`.
+   Other host failures are rethrown unchanged. Returns to."
   [from to]
-  (.linkSync node-fs (str from) (str to))
+  (try
+    (.linkSync node-fs (str from) (str to))
+    (catch :default error
+      (if (= "EEXIST" (.-code error))
+        (throw (ex-info "Exclusive link target already exists"
+                        {:exclusive-fs/error :already-exists
+                         :path (str to)}))
+        (throw error))))
   to)
 
 (defn write-new-file!
