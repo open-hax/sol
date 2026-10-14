@@ -43,18 +43,20 @@
         (do
           (when (or (fs/exists? ledger-file) schema-preexisting?)
             (throw (ex-info "Clio initialization requires a fresh storage epoch" {})))
+          ;; Claim the schema directory before creating the ledger parent or
+          ;; file. If schema-directory is an ancestor of ledger-file,
+          ;; ensure-dir! on the ledger parent would create the schema dir
+          ;; first; exclusive mkdir would then fail with EEXIST and
+          ;; schema-created? would stay false, so rollback would leave an
+          ;; orphan directory that blocks the next fresh-epoch check.
+          (fs/ensure-dir! (path/dirname schema-directory))
+          (exclusive-fs/create-directory! schema-directory #(reset! schema-created? true))
           (fs/ensure-dir! (path/dirname ledger-file))
           ;; Same empty exclusive file as ledger/create-ledger!, but ownership
           ;; is recorded as soon as the exclusive open succeeds, so a failing
           ;; descriptor close still rolls the new ledger back. An exclusive-open
           ;; failure never claims (or deletes) a file another attempt created.
-          (exclusive-fs/create-file! ledger-file #(reset! ledger-created? true))
-          ;; The fresh-epoch check above is not ownership: another initializer
-          ;; may create the same schema directory before this one writes it.
-          ;; Claim it with an exclusive mkdir, so rollback only ever removes a
-          ;; directory this attempt created.
-          (fs/ensure-dir! (path/dirname schema-directory))
-          (exclusive-fs/create-directory! schema-directory #(reset! schema-created? true)))
+          (exclusive-fs/create-file! ledger-file #(reset! ledger-created? true)))
         (do
           ;; Upstream refuses deleted/misspelled paths instead of inventing history.
           (ledger/read-ledgers [ledger-file])

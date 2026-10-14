@@ -108,6 +108,32 @@
           (is (re-find #"not configured" (.-message error)))))
       (finally (fs/remove-tree! root)))))
 
+(deftest schema-directory-ancestor-of-ledger-is-claimed-before-ledger-parent-test
+  "When schema-directory is an ancestor of ledger-file, claiming schema first
+   keeps exclusive mkdir ownership so a later failure still rolls the dir back.
+   (A successful reopen uses sibling paths; ledger-inside-schema is not a
+   supported layout because runtime treats every EDN under schema-directory
+   as a schema snapshot.)"
+  (let [root (scratch)
+        schema-directory (path/join root "epoch")
+        ledger-file (path/join schema-directory "events.edn")
+        original-open runtime/open]
+    (try
+      (with-redefs [runtime/open (fn [directory _catalog]
+                                   (fs/ensure-dir! directory)
+                                   (throw (ex-info "schema materialization failed" {})))]
+        (is (thrown-with-msg? cljs.core/ExceptionInfo #"schema materialization failed"
+              (store/open! {:ledger-file ledger-file
+                            :schema-directory schema-directory
+                            :initialize? true}))))
+      (is (not (fs/exists? ledger-file)) "partial ledger removed")
+      (is (not (fs/exists? schema-directory))
+          "schema directory claimed by this attempt removed even when it is an ancestor of the ledger")
+      (is (identical? original-open runtime/open))
+      (let [canonical-store (store/open! (assoc (options root) :initialize? true))]
+        (is (= [] (store/events canonical-store)) "retry with sibling paths still sees a fresh storage epoch"))
+      (finally (fs/remove-tree! root)))))
+
 (deftest failed-initialization-rolls-back-only-its-own-artifacts-test
   (let [root (scratch)
         {:keys [ledger-file schema-directory] :as opts} (options root)
@@ -163,23 +189,20 @@
 (deftest failed-initialization-keeps-a-schema-directory-another-attempt-claimed-test
   (let [root (scratch)
         {:keys [ledger-file schema-directory] :as opts} (options root)
-        original-create exclusive-fs/create-file!
         other-revision (path/join schema-directory "other.edn")
         other "{:written/by \"another initializer\"}\n"]
     (try
-      (with-redefs [exclusive-fs/create-file!
-                    (fn [p on-created]
-                      (original-create p on-created)
-                      ;; A second initializer with its own ledger but the same,
-                      ;; initially absent schema directory materializes schema
-                      ;; history between this attempt's fresh-epoch check and
-                      ;; its schema write.
-                      (fs/ensure-dir! schema-directory)
-                      (fs/write-text! other-revision other))
-                    ledger/canonicalize-files
-                    (fn [& _] (throw (ex-info "canonicalization failed" {})))]
-        (is (thrown? js/Error (store/open! (assoc opts :initialize? true)))))
-      (is (not (fs/exists? ledger-file)) "this attempt's own ledger removed")
+      (with-redefs [exclusive-fs/create-directory!
+                    (fn [p _on-created]
+                      ;; Another initializer claimed the same schema directory
+                      ;; between this attempt's fresh-epoch check and its
+                      ;; exclusive mkdir. We must not delete their directory.
+                      (fs/ensure-dir! p)
+                      (fs/write-text! other-revision other)
+                      (throw (js/Error. "EEXIST: directory already exists")))]
+        (is (thrown-with-msg? js/Error #"EEXIST"
+              (store/open! (assoc opts :initialize? true)))))
+      (is (not (fs/exists? ledger-file)) "this attempt never created a ledger")
       (is (= other (fs/read-text other-revision))
           "the schema directory another initializer claimed is kept")
       (finally (fs/remove-tree! root)))))
