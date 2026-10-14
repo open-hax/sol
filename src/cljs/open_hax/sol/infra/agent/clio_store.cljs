@@ -6,6 +6,7 @@
             [clio.infra.ledger :as ledger]
             [clio.infra.runtime :as runtime]
             [clojure.string :as str]
+            [open-hax.sol.domain.node.fs :as node-fs]
             [open-hax.sol.domain.node.path :as path]
             [open-hax.sol.extern.exclusive-fs :as exclusive-fs]
             [open-hax.sol.law.lifecycle-catalog :as lifecycle]))
@@ -25,15 +26,31 @@
     (cleanup!)
     (catch :default _ nil)))
 
+(defn- canonical-path
+  "Absolute path with existing ancestors realpath'd and missing suffixes
+   appended. Symlink aliases that meet the same physical location compare
+   equal, so nest checks see the layout the runtime will actually use."
+  [p]
+  (let [resolved (path/resolve p)]
+    (loop [cur resolved
+           suffix ()]
+      (if (fs/exists? cur)
+        (apply path/join (node-fs/realpath cur) suffix)
+        (let [parent (path/dirname cur)]
+          (if (= parent cur)
+            resolved
+            (recur parent (cons (path/basename cur) suffix))))))))
+
 (defn- path-beneath?
   "True when `descendant` resolves strictly under `ancestor`.
-   An absolute relative (Windows cross-drive) is not a descendant.
-   Parent-escape is a path-segment check: a component named exactly `..`
-   escapes; a sibling segment that merely starts with `..` (e.g. `..d`)
-   remains a descendant."
+   Existing parents are canonicalized (realpath) before the check so a
+   symlink alias that reaches a nested layout is refused. An absolute
+   relative (Windows cross-drive) is not a descendant. Parent-escape is a
+   path-segment check: a component named exactly `..` escapes; a sibling
+   segment that merely starts with `..` (e.g. `..d`) remains a descendant."
   [ancestor descendant]
-  (let [a (path/resolve ancestor)
-        d (path/resolve descendant)
+  (let [a (canonical-path ancestor)
+        d (canonical-path descendant)
         rel (path/relative a d)]
     (and (not= a d)
          (not (str/blank? rel))
@@ -64,7 +81,7 @@
           ;; snapshot by runtime and makes the store unusable.
           (when (or (path-beneath? ledger-file schema-directory)
                     (path-beneath? schema-directory ledger-file)
-                    (= (path/resolve ledger-file) (path/resolve schema-directory)))
+                    (= (canonical-path ledger-file) (canonical-path schema-directory)))
             (throw (ex-info
                     "Clio ledger file and schema directory must not nest"
                     {:ledger-file ledger-file :schema-directory schema-directory})))
@@ -83,7 +100,9 @@
           ;; Upstream refuses deleted/misspelled paths instead of inventing history.
           (ledger/read-ledgers [ledger-file])
           ;; Reopening is not initialization, including a missing schema history.
-          (when-not schema-preexisting?
+          ;; Recheck after the ledger read: a directory that vanished mid-read
+          ;; must still refuse rather than letting runtime/open recreate it.
+          (when-not (fs/exists? schema-directory)
             (throw (ex-info "Explicit Clio schema history is missing" {})))))
       ;; Precompute the revision path this attempt will persist so rollback
       ;; deletes only that artifact (and tmp companions), never a concurrent

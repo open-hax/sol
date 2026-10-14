@@ -9,7 +9,8 @@
             [open-hax.sol.extern.exclusive-fs :as exclusive-fs]
             [open-hax.sol.infra.agent.clio-store :as store]
             [open-hax.sol.infra.agent.episode-ledger :as episode]
-            [open-hax.sol.infra.agent.session-store :as sessions]))
+            [open-hax.sol.infra.agent.session-store :as sessions]
+            ["node:fs" :as node-fs]))
 
 (defn scratch [] (path/resolve ".ημ" "sol-clio-tests" (str (random-uuid))))
 (defn options [root]
@@ -187,6 +188,50 @@
                           :initialize? true})))
       (is (not (fs/exists? schema-directory)) "nothing created")
       (is (not (fs/exists? ledger-file)))
+      (finally (fs/remove-tree! root)))))
+
+(deftest symlink-nested-ledger-under-schema-is-rejected-test
+  "Lexical path-beneath misses nesting when paths meet through a symlink.
+   If /alias points at /real/root, schema=/real/root/schemas and
+   ledger=/alias/schemas/events.edn are physically nested; refuse before
+   creating either path."
+  (let [root (scratch)
+        real-root (path/join root "real" "root")
+        alias-root (path/join root "alias")
+        schema-directory (path/join real-root "schemas")
+        ledger-file (path/join alias-root "schemas" "events.edn")]
+    (try
+      (fs/ensure-dir! real-root)
+      (.symlinkSync node-fs real-root alias-root)
+      (is (thrown-with-msg? cljs.core/ExceptionInfo #"must not nest"
+            (store/open! {:ledger-file ledger-file
+                          :schema-directory schema-directory
+                          :initialize? true})))
+      (is (not (fs/exists? schema-directory)) "schema directory never claimed")
+      (is (not (fs/exists? ledger-file)) "ledger never created under the alias")
+      (is (not (fs/exists? (path/join alias-root "schemas")))
+          "alias schemas parent never created")
+      (finally (fs/remove-tree! root)))))
+
+(deftest reopen-rechecks-schema-directory-after-ledger-read-test
+  "On reopen, if the schema directory exists at entry but is removed while
+   read-ledgers runs, refuse missing history rather than letting runtime/open
+   materialize a new schema directory."
+  (let [root (scratch)
+        {:keys [ledger-file schema-directory] :as opts} (options root)
+        original-read ledger/read-ledgers]
+    (try
+      (store/open! (assoc opts :initialize? true))
+      (with-redefs [ledger/read-ledgers
+                    (fn [files]
+                      (let [result (original-read files)]
+                        (fs/remove-tree! schema-directory)
+                        result))]
+        (is (thrown-with-msg? cljs.core/ExceptionInfo #"schema history"
+              (store/open! opts))))
+      (is (not (fs/exists? schema-directory))
+          "reopen must not recreate schema history after the race")
+      (is (fs/exists? ledger-file) "ledger from the original epoch remains")
       (finally (fs/remove-tree! root)))))
 
 (deftest failed-initialization-rolls-back-only-its-own-artifacts-test
