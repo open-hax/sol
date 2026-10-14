@@ -119,18 +119,19 @@
         (reset! schema-created? false)
         committed)
       (catch :default error
-        ;; Only unlink a ledger we still exclusively own (empty). If another
-        ;; process reopened and appended during runtime/open, size > 0 — leave
-        ;; their accepted history alone.
-        (when @ledger-created?
-          (attempt-cleanup!
-           #(when (exclusive-fs/empty-regular-file? ledger-file)
-              (fs/delete-if-exists! ledger-file))))
-        (when @schema-created?
-          (attempt-cleanup!
-           #(exclusive-fs/rollback-owned-directory!
-             schema-directory
-             [(str schema-directory "/" (:schema/root @local-revision) ".edn")])))
+        ;; Only unlink artifacts we still exclusively own. If another process
+        ;; reopened and appended during runtime/open, the ledger is non-empty —
+        ;; leave both ledger and schema so their accepted history stays reopenable.
+        (let [still-private?
+              (or (not (fs/exists? ledger-file))
+                  (exclusive-fs/empty-regular-file? ledger-file))]
+          (when (and @ledger-created? still-private?)
+            (attempt-cleanup! #(fs/delete-if-exists! ledger-file)))
+          (when (and @schema-created? still-private?)
+            (attempt-cleanup!
+             #(exclusive-fs/rollback-owned-directory!
+               schema-directory
+               [(str schema-directory "/" (:schema/root @local-revision) ".edn")]))))
         (throw error)))))
 
 (defn append!
