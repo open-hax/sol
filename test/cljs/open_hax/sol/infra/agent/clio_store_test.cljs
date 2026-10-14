@@ -1127,3 +1127,27 @@
           (is (= [] (store/events canonical-store))
               "initialize? reopens the epoch the peer just committed")))
       (finally (fs/remove-tree! root)))))
+
+(deftest unreadable-marker-on-an-uncommitted-claim-is-rolled-back-test
+  "An empty or partial marker (e.g. left by an older truncate-and-rewrite
+   writer) on a claim with no revision snapshots is rolled back under the init
+   lock instead of wedging startup; an unverifiable ledger is preserved."
+  (let [root (scratch)
+        {:keys [ledger-file schema-directory] :as opts} (options root)]
+    (try
+      (fs/ensure-dir! schema-directory)
+      (fs/write-text! (init-marker-path schema-directory) "{:sol.clio/init-pending tr")
+      (let [canonical-store (store/open! (assoc opts :initialize? true))]
+        (is (= [] (store/events canonical-store))
+            "unreadable marker on an empty claim: roll back, then initialize fresh")
+        (is (not (fs/exists? (init-marker-path schema-directory)))))
+      (fs/remove-tree! root)
+      (fs/ensure-dir! (path/dirname ledger-file))
+      (fs/write-text! ledger-file "foreign\n")
+      (fs/ensure-dir! schema-directory)
+      (fs/write-text! (init-marker-path schema-directory) "")
+      (is (thrown-with-msg? cljs.core/ExceptionInfo #"fresh storage epoch"
+            (store/open! (assoc opts :initialize? true))))
+      (is (= "foreign\n" (fs/read-text ledger-file))
+          "a ledger whose identity cannot be verified is never deleted")
+      (finally (fs/remove-tree! root)))))
