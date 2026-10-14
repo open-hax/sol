@@ -686,21 +686,18 @@
       (finally (fs/remove-tree! root)))))
 
 (deftest failed-initialization-keeps-a-schema-directory-another-attempt-claimed-test
+  ;; Another initializer already owns schema-directory when this attempt tries
+  ;; to expose its private claim via rename; their directory must be kept.
   (let [root (scratch)
         {:keys [ledger-file schema-directory] :as opts} (options root)
         other-revision (path/join schema-directory "other.edn")
         other "{:written/by \"another initializer\"}\n"]
     (try
-      (with-redefs [exclusive-fs/create-directory!
-                    (fn [p _on-created]
-                      ;; Another initializer claimed the same schema directory
-                      ;; between this attempt's fresh-epoch check and its
-                      ;; exclusive mkdir. We must not delete their directory.
-                      (fs/ensure-dir! p)
-                      (fs/write-text! other-revision other)
-                      (throw (js/Error. "EEXIST: directory already exists")))]
-        (is (thrown-with-msg? js/Error #"EEXIST"
-              (store/open! (assoc opts :initialize? true)))))
+      (fs/ensure-dir! schema-directory)
+      (fs/write-text! other-revision other)
+      (is (thrown-with-msg? cljs.core/ExceptionInfo #"fresh storage epoch"
+            (store/open! (assoc opts :initialize? true)))
+          "existing peer-owned schema directory fails the fresh-epoch check")
       (is (not (fs/exists? ledger-file)) "this attempt never created a ledger")
       (is (= other (fs/read-text other-revision))
           "the schema directory another initializer claimed is kept")
@@ -958,30 +955,42 @@
           "empty incomplete schema claim still released")
       (finally (fs/remove-tree! root)))))
 
-(deftest init-marker-is-written-immediately-after-schema-claim-test
-  "Crash after exclusive mkdir but before staging must leave a recoverable
-   marker (or a markerless empty claim that recovery removes)."
+(deftest init-marker-is-locked-before-claim-is-exposed-test
+  "The claim directory is published only after the marker exists: rename onto
+   schema-directory is the expose point, and the schema path is still absent."
   (let [root (scratch)
         {:keys [schema-directory] :as opts} (options root)
-        original-create exclusive-fs/create-directory!
-        saw-marker (atom false)]
+        original-rename exclusive-fs/rename-new!
+        saw (atom nil)]
     (try
-      (with-redefs [exclusive-fs/create-directory!
-                    (fn [p on-created]
-                      (let [result (original-create p on-created)]
-                        (when (= p schema-directory)
-                          (reset! saw-marker
-                                  (fs/exists? (init-marker-path schema-directory)))
-                          (throw (ex-info "crash after claim" {})))
-                        result))]
-        (is (thrown-with-msg? cljs.core/ExceptionInfo #"crash after claim"
+      (with-redefs [exclusive-fs/rename-new!
+                    (fn [from to]
+                      (when (= to schema-directory)
+                        (reset! saw {:marker (fs/exists? (init-marker-path from))
+                                     :exposed? (fs/exists? schema-directory)})
+                        (throw (ex-info "crash before expose" {})))
+                      (original-rename from to))]
+        (is (thrown-with-msg? cljs.core/ExceptionInfo #"crash before expose"
               (store/open! (assoc opts :initialize? true)))))
-      (is (true? @saw-marker)
-          "marker exists before any staging work")
-      (is (not (fs/exists? schema-directory))
-          "failed attempt rolled the claim back")
+      (is (true? (:marker @saw)) "marker written before expose")
+      (is (false? (:exposed? @saw)) "schema path not visible before rename")
+      (is (not (fs/exists? schema-directory)) "claim never exposed")
       (let [canonical-store (store/open! (assoc opts :initialize? true))]
         (is (= [] (store/events canonical-store))))
+      (finally (fs/remove-tree! root)))))
+
+(deftest initialize-reopens-committed-epoch-without-marker-test
+  "If initialize committed then died after clearing the marker, a restart
+   with initialize? reopens the epoch instead of refusing non-fresh paths."
+  (let [root (scratch)
+        {:keys [schema-directory] :as opts} (options root)]
+    (try
+      (store/open! (assoc opts :initialize? true))
+      (is (nil? (when (fs/exists? (init-marker-path schema-directory))
+                  (fs/read-text (init-marker-path schema-directory)))))
+      (let [again (store/open! (assoc opts :initialize? true))]
+        (is (= [] (store/events again))
+            "initialize? reopens the already-committed epoch"))
       (finally (fs/remove-tree! root)))))
 
 (deftest hot-reload-reuses-transport-and-refuses-path-change-test

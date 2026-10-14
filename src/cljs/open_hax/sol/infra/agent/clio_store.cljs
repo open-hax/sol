@@ -66,11 +66,16 @@
   (path/join schema-directory init-marker-name))
 
 (defn- write-init-marker!
-  "Durable record that an initialization is in flight. Written immediately
-   after the schema directory is claimed so markerless empty claims are not
-   left behind, then updated before publish with staging and ledger identity."
+  "Create the durable init marker with a complete EDN body (exclusive create)."
   [schema-directory marker]
-  (fs/write-text! (init-marker-path schema-directory) (str (pr-str marker) "\n")))
+  (exclusive-fs/write-file-atomic!
+   (init-marker-path schema-directory)
+   (str (pr-str marker) "\n")))
+
+(defn- rewrite-init-marker!
+  "Update the marker through the held lock fd so the flock inode is preserved."
+  [lock marker]
+  (exclusive-fs/rewrite-file-in-place! lock (str (pr-str marker) "\n")))
 
 (defn- clear-init-marker!
   [schema-directory]
@@ -240,22 +245,14 @@
 
 (defn- initialize!
   "Create a fresh storage epoch whose artifacts stay private until commit.
-   The schema directory is claimed by exclusive mkdir; a durable
-   `.sol-clio-init` marker is written immediately and locked for the attempt
-   so recovery never races a live initializer. runtime/open materializes the
-   revision into a private staging directory and the ledger is created under
-   a private staging name. Publishing is two exclusive hard links: first the
-   ledger (already-exists if another attempt won the path), then the revision
-   into the claimed directory (the commit point). The marker records the
-   ledger inode after the first link so recovery can prove ownership. Process
-   death between the links is resumed or rolled back on the next open."
+   The claim is prepared privately (directory + complete marker + flock) and
+   renamed onto schema-directory so no peer observes an unlocked marker.
+   Marker updates go through the locked fd (same inode). Publishing is two
+   exclusive hard links: ledger then schema revision. The marker records the
+   ledger inode so recovery can prove ownership."
   [ledger-file schema-directory]
   (when (or (fs/exists? ledger-file) (fs/exists? schema-directory))
     (throw (ex-info "Clio initialization requires a fresh storage epoch" {})))
-  ;; Nested ledger/schema layouts are refused before creating anything:
-  ;; schema under the ledger path leaves a directory at the ledger on
-  ;; failure; ledger under the schema path is treated as a schema
-  ;; snapshot by runtime and makes the store unusable.
   (when (or (path-beneath? ledger-file schema-directory)
             (path-beneath? schema-directory ledger-file)
             (= (canonical-path ledger-file) (canonical-path schema-directory)))
@@ -263,6 +260,7 @@
             "Clio ledger file and schema directory must not nest"
             {:ledger-file ledger-file :schema-directory schema-directory})))
   (let [attempt (random-uuid)
+        claim-directory (str schema-directory ".claim-" attempt)
         staging-ledger (str ledger-file ".init-" attempt)
         staging-schema (str schema-directory ".init-" attempt)
         staging-ledger? (atom false)
@@ -271,45 +269,38 @@
         ledger-published? (atom false)
         init-lock (atom nil)]
     (try
-      ;; Claim the schema directory and publish the recovery marker before any
-      ;; other work so a crash cannot leave a markerless empty claim.
       (fs/ensure-dir! (path/dirname schema-directory))
-      ;; Marker is written inside on-created so the claim is never exposed
-      ;; without recovery metadata: mkdir succeeds, then marker, then the
-      ;; caller observes the directory.
       (exclusive-fs/create-directory!
-       schema-directory
+       claim-directory
        (fn []
-         (reset! schema-claimed? true)
-         (write-init-marker! schema-directory
+         (write-init-marker! claim-directory
                              {:sol.clio/init-pending true
                               :phase :claimed
                               :ledger-file ledger-file
                               :schema-directory schema-directory})))
-      (reset! init-lock (exclusive-fs/lock-file! (init-marker-path schema-directory)))
+      (reset! init-lock (exclusive-fs/lock-file! (init-marker-path claim-directory)))
+      (exclusive-fs/rename-new! claim-directory schema-directory)
+      (reset! schema-claimed? true)
       (exclusive-fs/create-directory! staging-schema #(reset! staging-schema? true))
       (fs/ensure-dir! (path/dirname ledger-file))
-      ;; Ownership is recorded as soon as the exclusive open succeeds, so a
-      ;; failing descriptor close still rolls the staging file back.
       (exclusive-fs/create-file! staging-ledger #(reset! staging-ledger? true))
       (let [staged (runtime/open staging-schema lifecycle/catalog)
             root (:schema/root (:schema/current staged))
             _ (ledger/canonicalize-files (:schema/revisions staged) [staging-ledger])
             ledger-identity (exclusive-fs/file-identity staging-ledger)]
-        (write-init-marker! schema-directory
-                            {:sol.clio/init-pending true
-                             :phase :publishing
-                             :ledger-file ledger-file
-                             :schema-directory schema-directory
-                             :staging-ledger staging-ledger
-                             :staging-schema staging-schema
-                             :schema/root root
-                             :ledger-identity ledger-identity})
+        (rewrite-init-marker! @init-lock
+                              {:sol.clio/init-pending true
+                               :phase :publishing
+                               :ledger-file ledger-file
+                               :schema-directory schema-directory
+                               :staging-ledger staging-ledger
+                               :staging-schema staging-schema
+                               :schema/root root
+                               :ledger-identity ledger-identity})
         (exclusive-fs/link-new! staging-ledger ledger-file)
         (reset! ledger-published? true)
         (exclusive-fs/link-new! (schema-store/revision-path staging-schema root)
                                 (schema-store/revision-path schema-directory root))
-        ;; Committed. Release the lock, clear the marker, drop staging.
         (exclusive-fs/release-lock! @init-lock)
         (reset! init-lock nil)
         (clear-init-marker! schema-directory)
@@ -335,7 +326,11 @@
         (when @schema-claimed?
           (clear-init-marker! schema-directory)
           (attempt-cleanup! #(exclusive-fs/remove-directory-if-empty! schema-directory)))
+        (when (fs/exists? claim-directory)
+          (clear-init-marker! claim-directory)
+          (attempt-cleanup! #(fs/remove-tree! claim-directory)))
         (throw error)))))
+
 
 (defn- reopen!
   [ledger-file schema-directory]
@@ -360,6 +355,15 @@
   (let [recovery (recover-incomplete-initialization! ledger-file schema-directory)]
     (cond
       (= :resumed recovery)
+      (reopen! ledger-file schema-directory)
+
+      ;; Committed epoch left after a crash past marker clear: initialize?
+      ;; supervisors reopen rather than refuse non-fresh paths.
+      (and initialize?
+           (fs/exists? ledger-file)
+           (fs/exists? schema-directory)
+           (nil? (read-init-marker schema-directory))
+           (seq (schema-edn-revisions schema-directory)))
       (reopen! ledger-file schema-directory)
 
       initialize?

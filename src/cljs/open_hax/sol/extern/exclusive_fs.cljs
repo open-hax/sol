@@ -139,3 +139,45 @@
           constants (.-constants fse)]
       (try (.flockSync fse fd (.-LOCK_UN constants)) (catch :default _ nil))
       (try (.closeSync node-fs fd) (catch :default _ nil)))))
+
+
+(defn rename-new!
+  "Atomically rename `from` to `to`. Fails if `to` already exists (no replace).
+   Used to publish a privately prepared claim directory."
+  [from to]
+  (try
+    (.renameSync node-fs (str from) (str to))
+    (catch :default error
+      (let [code (.-code error)]
+        (if (or (= "EEXIST" code) (= "ENOTEMPTY" code) (= "EBUSY" code))
+          (throw (ex-info "Exclusive rename target already exists"
+                          {:exclusive-fs/error :already-exists
+                           :path (str to)}))
+          (throw error)))))
+  to)
+
+(defn write-file-atomic!
+  "Create `p` with complete `text` via exclusive create (wx). For the first
+   marker write only; later updates must use rewrite-file-in-place! so a held
+   flock keeps the same inode."
+  [p text]
+  (write-new-file! p text (fn [] nil))
+  p)
+
+(defn rewrite-file-in-place!
+  "Overwrite the locked file's contents through its open fd, preserving the
+   inode so an exclusive flock remains valid."
+  [lock text]
+  (let [fd (:fd lock)
+        bytes (.from js/Buffer (str text) "utf8")
+        total (.-length bytes)]
+    (.ftruncateSync node-fs fd 0)
+    (loop [offset 0]
+      (when (< offset total)
+        (let [written (.writeSync node-fs fd bytes offset (- total offset))]
+          (when-not (pos? written)
+            (throw (ex-info "File write made no progress"
+                            {:path (:path lock) :offset offset})))
+          (recur (+ offset written)))))
+    (.fsyncSync node-fs fd))
+  (:path lock))
