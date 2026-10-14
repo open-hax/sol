@@ -2,9 +2,7 @@
   "Clio storage filesystem boundary: exclusive create/rollback and canonical
    path resolution. Raw `node:fs` descriptors stay in this extern namespace;
    callers receive only paths and an ownership callback."
-  (:require ["node:fs" :as node-fs]
-            ["node:path" :as node-path]
-            [clojure.string :as str]))
+  (:require ["node:fs" :as node-fs]))
 
 (defn realpath
   "Resolve symlinks to the canonical absolute path. Throws if `p` is missing."
@@ -42,19 +40,32 @@
       (when (.isFile st)
         (.unlinkSync node-fs (str p))))))
 
+(defn directory-empty?
+  "True when p exists as a directory with no entries."
+  [p]
+  (and (.existsSync node-fs (str p))
+       (.isDirectory (.lstatSync node-fs (str p)))
+       (zero? (alength (.readdirSync node-fs (str p))))))
+
+(defn empty-regular-file?
+  "True when p exists as a regular file of size 0. Used so initialization
+   rollback does not unlink a ledger another process has already appended to."
+  [p]
+  (boolean
+   (when (.existsSync node-fs (str p))
+     (let [st (.lstatSync node-fs (str p))]
+       (and (.isFile st) (zero? (.-size st)))))))
+
 (defn rollback-owned-directory!
-  "Remove only `owned-files` (and matching `.tmp-*` companions) under p, then
-   the directory itself when empty. Other children — nested directories or
-   concurrent ledger files — are left in place."
+  "Remove only `owned-files` under p, then the directory itself when empty.
+   Other children — nested directories, concurrent ledger files, or Clio's own
+   `<root>.edn.tmp-<uuid>` snapshots from a concurrent `runtime/open` — are
+   left in place. Clio deletes its own temporary schema file in `finally`."
   [p owned-files]
   (let [root (str p)]
     (doseq [owned owned-files
             :let [target (str owned)]]
-      (delete-if-file! target)
-      (when (.existsSync node-fs root)
-        (doseq [name (.readdirSync node-fs root)
-                :when (str/starts-with? (str name) (str (.basename node-path target) ".tmp-"))]
-          (delete-if-file! (.join node-path root name)))))
+      (delete-if-file! target))
     (when (.existsSync node-fs root)
       (try
         (.rmdirSync node-fs root)

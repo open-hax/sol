@@ -102,16 +102,30 @@
           ;; Recheck after the ledger read: a directory that vanished mid-read
           ;; must still refuse rather than letting runtime/open recreate it.
           (when-not (fs/exists? schema-directory)
+            (throw (ex-info "Explicit Clio schema history is missing" {})))
+          ;; An empty schema directory is also missing history: runtime/open
+          ;; would silently materialize the current revision and report ready.
+          (when (exclusive-fs/directory-empty? schema-directory)
             (throw (ex-info "Explicit Clio schema history is missing" {})))))
       ;; Precompute the revision path this attempt will persist so rollback
-      ;; deletes only that artifact (and tmp companions), never a concurrent
-      ;; child ledger file under the schema directory.
-      (let [runtime (runtime/open schema-directory lifecycle/catalog)]
-        (ledger/canonicalize-files (:schema/revisions runtime) [ledger-file])
-        {:runtime runtime :ledger-file ledger-file :schema-directory schema-directory})
+      ;; deletes only that artifact, never a concurrent child under the schema
+      ;; directory. Hold the initialization claim until commit succeeds so a
+      ;; concurrent reopen that began using the new ledger cannot have its
+      ;; accepted history unlinked on failure.
+      (let [runtime (runtime/open schema-directory lifecycle/catalog)
+            _ (ledger/canonicalize-files (:schema/revisions runtime) [ledger-file])
+            committed {:runtime runtime :ledger-file ledger-file :schema-directory schema-directory}]
+        (reset! ledger-created? false)
+        (reset! schema-created? false)
+        committed)
       (catch :default error
+        ;; Only unlink a ledger we still exclusively own (empty). If another
+        ;; process reopened and appended during runtime/open, size > 0 — leave
+        ;; their accepted history alone.
         (when @ledger-created?
-          (attempt-cleanup! #(fs/delete-if-exists! ledger-file)))
+          (attempt-cleanup!
+           #(when (exclusive-fs/empty-regular-file? ledger-file)
+              (fs/delete-if-exists! ledger-file))))
         (when @schema-created?
           (attempt-cleanup!
            #(exclusive-fs/rollback-owned-directory!
