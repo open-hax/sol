@@ -26,13 +26,15 @@
     (catch :default _ nil)))
 
 (defn- path-beneath?
-  "True when `descendant` resolves strictly under `ancestor`."
+  "True when `descendant` resolves strictly under `ancestor`.
+   An absolute relative (Windows cross-drive) is not a descendant."
   [ancestor descendant]
   (let [a (path/resolve ancestor)
         d (path/resolve descendant)
         rel (path/relative a d)]
     (and (not= a d)
          (not (str/blank? rel))
+         (not (path/absolute? rel))
          (not (str/starts-with? rel "..")))))
 
 (defn open!
@@ -53,20 +55,19 @@
         (do
           (when (or (fs/exists? ledger-file) schema-preexisting?)
             (throw (ex-info "Clio initialization requires a fresh storage epoch" {})))
-          ;; ledger-file is a file path. If it is an ancestor of schema-directory,
-          ;; ensure-dir! on the schema parent would create a directory at the
-          ;; ledger path; exclusive ledger create then fails with EEXIST, and
-          ;; rollback would leave that directory blocking every retry.
-          (when (path-beneath? ledger-file schema-directory)
+          ;; Nested ledger/schema layouts are refused before creating anything:
+          ;; schema under the ledger path leaves a directory at the ledger on
+          ;; failure; ledger under the schema path is treated as a schema
+          ;; snapshot by runtime and makes the store unusable.
+          (when (or (path-beneath? ledger-file schema-directory)
+                    (path-beneath? schema-directory ledger-file)
+                    (= (path/resolve ledger-file) (path/resolve schema-directory)))
             (throw (ex-info
-                    "Clio schema directory must not be nested under the ledger file path"
+                    "Clio ledger file and schema directory must not nest"
                     {:ledger-file ledger-file :schema-directory schema-directory})))
           ;; Claim the schema directory before creating the ledger parent or
-          ;; file. If schema-directory is an ancestor of ledger-file,
-          ;; ensure-dir! on the ledger parent would create the schema dir
-          ;; first; exclusive mkdir would then fail with EEXIST and
-          ;; schema-created? would stay false, so rollback would leave an
-          ;; orphan directory that blocks the next fresh-epoch check.
+          ;; file so exclusive mkdir owns the directory even when a later step
+          ;; fails.
           (fs/ensure-dir! (path/dirname schema-directory))
           (exclusive-fs/create-directory! schema-directory #(reset! schema-created? true))
           (fs/ensure-dir! (path/dirname ledger-file))
@@ -81,6 +82,9 @@
           ;; Reopening is not initialization, including a missing schema history.
           (when-not schema-preexisting?
             (throw (ex-info "Explicit Clio schema history is missing" {})))))
+      ;; Precompute the revision path this attempt will persist so rollback
+      ;; deletes only that artifact (and tmp companions), never a concurrent
+      ;; child ledger file under the schema directory.
       (let [runtime (runtime/open schema-directory lifecycle/catalog)]
         (ledger/canonicalize-files (:schema/revisions runtime) [ledger-file])
         {:runtime runtime :ledger-file ledger-file :schema-directory schema-directory})
@@ -88,10 +92,10 @@
         (when @ledger-created?
           (attempt-cleanup! #(fs/delete-if-exists! ledger-file)))
         (when @schema-created?
-          ;; Do not remove-tree!: a concurrent initializer may have claimed a
-          ;; nested directory under this path. Only files we could have written
-          ;; and an empty owned directory are attributable to this attempt.
-          (attempt-cleanup! #(exclusive-fs/rollback-owned-directory! schema-directory)))
+          (attempt-cleanup!
+           #(exclusive-fs/rollback-owned-directory!
+             schema-directory
+             [(str schema-directory "/" (:schema/root @local-revision) ".edn")])))
         (throw error)))))
 
 (defn append!
@@ -134,16 +138,18 @@
 (defn- require-store-paths!
   "An open store keeps writing to the paths it was opened with; a config that
    names other paths is refused rather than returned with a mismatched store.
-   Pre-schema-directory store maps omit :schema-directory; a missing key is
-   not a path change when the ledger file still matches."
+   Pre-schema-directory store maps omit :schema-directory; recover it from the
+   runtime when present. A requested schema path that cannot be verified
+   against the open store requires a full restart."
   [config store]
   (let [requested-ledger (:clio/ledger-file config)
         requested-schema (:clio/schema-directory config)
         store-ledger (:ledger-file store)
-        store-schema (:schema-directory store)]
+        store-schema (or (:schema-directory store)
+                         (:schema/directory (:runtime store)))]
     (when (and (or (some? requested-ledger) (some? requested-schema))
                (or (not= requested-ledger store-ledger)
-                   (and (some? store-schema)
+                   (and (some? requested-schema)
                         (not= requested-schema store-schema))))
       (throw (ex-info "Changing Clio filesystem paths requires a full restart" {})))))
 

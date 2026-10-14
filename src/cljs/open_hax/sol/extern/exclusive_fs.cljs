@@ -3,7 +3,8 @@
    descriptors stay in this extern namespace; callers receive only paths and
    an ownership callback."
   (:require ["node:fs" :as node-fs]
-            ["node:path" :as node-path]))
+            ["node:path" :as node-path]
+            [clojure.string :as str]))
 
 (defn create-file!
   "Create an empty file with exclusive (`wx`) semantics, as Clio's
@@ -29,18 +30,27 @@
   (on-created)
   p)
 
-(defn rollback-owned-directory!
-  "Remove regular files under p that this initializer may have written, then
-   the directory itself only when empty. Nested directories are left in place
-   so a concurrent claim beneath p is not deleted."
+(defn- delete-if-file!
   [p]
+  (when (.existsSync node-fs (str p))
+    (let [st (.lstatSync node-fs (str p))]
+      (when (.isFile st)
+        (.unlinkSync node-fs (str p))))))
+
+(defn rollback-owned-directory!
+  "Remove only `owned-files` (and matching `.tmp-*` companions) under p, then
+   the directory itself when empty. Other children — nested directories or
+   concurrent ledger files — are left in place."
+  [p owned-files]
   (let [root (str p)]
+    (doseq [owned owned-files
+            :let [target (str owned)]]
+      (delete-if-file! target)
+      (when (.existsSync node-fs root)
+        (doseq [name (.readdirSync node-fs root)
+                :when (str/starts-with? (str name) (str (.basename node-path target) ".tmp-"))]
+          (delete-if-file! (.join node-path root name)))))
     (when (.existsSync node-fs root)
-      (doseq [name (.readdirSync node-fs root)]
-        (let [child (.join node-path root name)
-              st (.lstatSync node-fs child)]
-          (when (.isFile st)
-            (.unlinkSync node-fs child))))
       (try
         (.rmdirSync node-fs root)
         (catch :default _ nil))))

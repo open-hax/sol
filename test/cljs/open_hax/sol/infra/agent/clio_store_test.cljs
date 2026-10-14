@@ -115,7 +115,7 @@
         ledger-file (path/join root "epoch")
         schema-directory (path/join ledger-file "schemas")]
     (try
-      (is (thrown-with-msg? cljs.core/ExceptionInfo #"nested under the ledger"
+      (is (thrown-with-msg? cljs.core/ExceptionInfo #"must not nest"
             (store/open! {:ledger-file ledger-file
                           :schema-directory schema-directory
                           :initialize? true})))
@@ -123,22 +123,27 @@
       (is (not (fs/exists? schema-directory)) "schema directory never claimed")
       (finally (fs/remove-tree! root)))))
 
-(deftest failed-init-rollback-keeps-nested-schema-claimed-by-another-attempt-test
-  "Exclusive mkdir claims only the exact directory. A concurrent nested claim
-   under that path must survive this attempt's rollback."
+(deftest failed-init-rollback-keeps-concurrent-children-under-schema-directory-test
+  "Rollback deletes only this attempt's schema revision artifact. A concurrent
+   nested schema directory or sibling ledger file under the claimed path is kept."
   (let [root (scratch)
         {:keys [ledger-file schema-directory] :as opts} (options root)
         nested (path/join schema-directory "tenant-b")
         nested-revision (path/join nested "other.edn")
+        foreign-ledger (path/join schema-directory "tenant-b-ledger.edn")
         other "{:written/by \"nested initializer\"}
+"
+        foreign "{:written/by \"concurrent ledger\"}
 "
         original-open runtime/open]
     (try
       (with-redefs [runtime/open
                     (fn [directory catalog]
                       (when (= directory schema-directory)
+                        (original-open directory catalog)
                         (fs/ensure-dir! nested)
                         (fs/write-text! nested-revision other)
+                        (fs/write-text! foreign-ledger foreign)
                         (throw (ex-info "schema materialization failed" {})))
                       (original-open directory catalog))]
         (is (thrown-with-msg? cljs.core/ExceptionInfo #"schema materialization failed"
@@ -146,33 +151,24 @@
       (is (not (fs/exists? ledger-file)) "this attempt's ledger removed")
       (is (= other (fs/read-text nested-revision))
           "nested schema history claimed under this directory is kept")
-      (is (fs/exists? nested) "nested directory survives non-recursive rollback")
+      (is (= foreign (fs/read-text foreign-ledger))
+          "concurrent child ledger file is not unlinked")
+      (is (fs/exists? nested) "nested directory survives scoped rollback")
       (finally (fs/remove-tree! root)))))
 
-(deftest schema-directory-ancestor-of-ledger-is-claimed-before-ledger-parent-test
-  "When schema-directory is an ancestor of ledger-file, claiming schema first
-   keeps exclusive mkdir ownership so a later failure still rolls the dir back.
-   (A successful reopen uses sibling paths; ledger-inside-schema is not a
-   supported layout because runtime treats every EDN under schema-directory
-   as a schema snapshot.)"
+(deftest schema-directory-ancestor-of-ledger-is-rejected-before-creating-anything-test
+  "Ledger-inside-schema is unsupported: runtime treats every EDN under the
+   schema directory as a schema snapshot."
   (let [root (scratch)
         schema-directory (path/join root "epoch")
-        ledger-file (path/join schema-directory "events.edn")
-        original-open runtime/open]
+        ledger-file (path/join schema-directory "events.edn")]
     (try
-      (with-redefs [runtime/open (fn [directory _catalog]
-                                   (fs/ensure-dir! directory)
-                                   (throw (ex-info "schema materialization failed" {})))]
-        (is (thrown-with-msg? cljs.core/ExceptionInfo #"schema materialization failed"
-              (store/open! {:ledger-file ledger-file
-                            :schema-directory schema-directory
-                            :initialize? true}))))
-      (is (not (fs/exists? ledger-file)) "partial ledger removed")
-      (is (not (fs/exists? schema-directory))
-          "schema directory claimed by this attempt removed even when it is an ancestor of the ledger")
-      (is (identical? original-open runtime/open))
-      (let [canonical-store (store/open! (assoc (options root) :initialize? true))]
-        (is (= [] (store/events canonical-store)) "retry with sibling paths still sees a fresh storage epoch"))
+      (is (thrown-with-msg? cljs.core/ExceptionInfo #"must not nest"
+            (store/open! {:ledger-file ledger-file
+                          :schema-directory schema-directory
+                          :initialize? true})))
+      (is (not (fs/exists? schema-directory)) "nothing created")
+      (is (not (fs/exists? ledger-file)))
       (finally (fs/remove-tree! root)))))
 
 (deftest failed-initialization-rolls-back-only-its-own-artifacts-test
@@ -268,21 +264,70 @@
 
 (deftest ensure-configured-tolerates-legacy-store-without-schema-directory-test
   "Hot reload can carry a pre-PR store map that only recorded :ledger-file.
-   Missing :schema-directory is not a path change when the ledger still matches."
+   Recover the schema directory from the runtime when the top-level key is absent."
   (let [root (scratch)
         ledger (:ledger-file (options root))
         schema (:schema-directory (options root))
-        legacy-store {:runtime :legacy-runtime :ledger-file ledger}
+        legacy-store {:runtime {:schema/directory schema :schema/current :legacy}
+                      :ledger-file ledger}
         config {:clio/ledger-file ledger
                 :clio/schema-directory schema
                 :clio/store legacy-store}]
     (try
       (is (identical? legacy-store (:clio/store (store/ensure-configured! config)))
-          "legacy store is kept when ledger matches")
+          "legacy store is kept when ledger and recovered schema match")
       (is (thrown-with-msg? cljs.core/ExceptionInfo #"full restart"
             (store/ensure-configured!
              (assoc config :clio/ledger-file (path/join root "other.edn"))))
           "a real ledger change still requires a full restart")
+      (is (thrown-with-msg? cljs.core/ExceptionInfo #"full restart"
+            (store/ensure-configured!
+             (assoc config :clio/schema-directory (path/join root "other-schemas"))))
+          "a schema path change recovered from runtime still requires a full restart")
+      (finally (fs/remove-tree! root)))))
+
+(deftest ensure-configured-rejects-unverifiable-legacy-schema-path-test
+  "When the open store cannot name its schema directory, a requested schema
+   path is refused rather than treated as unchanged."
+  (let [root (scratch)
+        ledger (:ledger-file (options root))
+        schema (:schema-directory (options root))
+        legacy-store {:runtime :opaque :ledger-file ledger}
+        config {:clio/ledger-file ledger
+                :clio/schema-directory schema
+                :clio/store legacy-store}]
+    (try
+      (is (thrown-with-msg? cljs.core/ExceptionInfo #"full restart"
+            (store/ensure-configured! config)))
+      (finally (fs/remove-tree! root)))))
+
+(deftest path-beneath-ignores-absolute-cross-drive-relatives-test
+  (let [root (scratch)
+        ledger (path/join root "events.edn")
+        schema (path/join root "schemas")]
+    (try
+      (with-redefs [path/relative (fn [_ _] "D:\\schemas")
+                    path/absolute? (fn [p] (boolean (or (re-find #"^/" (str p))
+                                                        (re-find #"^[A-Za-z]:" (str p)))))]
+        ;; Sibling layout would nest-check both directions; absolute relatives
+        ;; must not spuriously trip the guard before exclusive creates run.
+        (let [created (atom false)]
+          (with-redefs [exclusive-fs/create-directory!
+                        (fn [p on-created]
+                          (reset! created true)
+                          (on-created)
+                          p)
+                        exclusive-fs/create-file!
+                        (fn [p on-created]
+                          (on-created)
+                          p)
+                        runtime/open
+                        (fn [_ _] (throw (ex-info "stop after nest checks" {})))]
+            (is (thrown-with-msg? cljs.core/ExceptionInfo #"stop after nest checks"
+                  (store/open! {:ledger-file ledger
+                                :schema-directory schema
+                                :initialize? true})))
+            (is @created "nest guard allowed sibling paths when relative was absolute"))))
       (finally (fs/remove-tree! root)))))
 
 (deftest failed-reopen-leaves-existing-history-test
