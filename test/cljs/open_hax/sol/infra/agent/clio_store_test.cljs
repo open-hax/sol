@@ -429,7 +429,7 @@
     (try
       (with-redefs [exclusive-fs/link-new!
                     (fn [from to]
-                      (if (str/starts-with? (str to) (str schema-directory "/"))
+                      (if (= (path/resolve schema-directory) (path/dirname (path/resolve to)))
                         (throw (ex-info "schema publish failed" {}))
                         (original-link from to)))]
         (is (thrown-with-msg? cljs.core/ExceptionInfo #"schema publish failed"
@@ -1242,4 +1242,41 @@
       (is (fs/exists? (init-marker-path schema-directory)) "recovery evidence kept")
       (let [canonical-store (store/open! (assoc opts :initialize? true))]
         (is (= [] (store/events canonical-store)) "next start recovers"))
+      (finally (fs/remove-tree! root)))))
+
+(deftest schema-publish-failure-never-unlinks-a-ledger-another-process-appended-test
+  ;; The ledger is visible between its link and the schema link; an append by
+  ;; another opener in that window must survive the rollback.
+  (let [root (scratch)
+        {:keys [ledger-file schema-directory] :as opts} (options root)
+        accepted "{:accepted/by \"other opener\"}\n"
+        original-link exclusive-fs/link-new!]
+    (try
+      (with-redefs [exclusive-fs/link-new!
+                    (fn [from to]
+                      (if (= (path/resolve schema-directory) (path/dirname (path/resolve to)))
+                        (do (fs/append-text! ledger-file accepted)
+                            (throw (ex-info "schema publish failed" {})))
+                        (original-link from to)))]
+        (is (thrown-with-msg? cljs.core/ExceptionInfo #"schema publish failed"
+              (store/open! (assoc opts :initialize? true)))))
+      (is (and (fs/exists? ledger-file) (= accepted (fs/read-text ledger-file)))
+          "the other process's accepted history is kept")
+      (is (= [] (staging-leftovers ledger-file)))
+      (finally (fs/remove-tree! root)))))
+
+(deftest stale-claim-evidence-never-adopts-a-directory-sol-did-not-create-test
+  ;; Claim evidence must name the identity of the directory Sol created; a
+  ;; stale claim beside a foreign empty directory proves nothing.
+  (let [root (scratch)
+        {:keys [ledger-file schema-directory] :as opts} (options root)]
+    (try
+      (fs/ensure-dir! schema-directory)
+      (fs/write-text! (str (path/resolve schema-directory) ".sol-clio-claim")
+                      (str (pr-str {:sol.clio/claim (path/resolve schema-directory)}) "\n"))
+      (let [identity (exclusive-fs/file-identity schema-directory)]
+        (is (thrown-with-msg? cljs.core/ExceptionInfo #"fresh storage epoch"
+              (store/open! (assoc opts :initialize? true))))
+        (is (= identity (exclusive-fs/file-identity schema-directory)) "foreign directory kept")
+        (is (not (fs/exists? ledger-file))))
       (finally (fs/remove-tree! root)))))
