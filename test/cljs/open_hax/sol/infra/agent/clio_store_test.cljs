@@ -1151,3 +1151,95 @@
       (is (= "foreign\n" (fs/read-text ledger-file))
           "a ledger whose identity cannot be verified is never deleted")
       (finally (fs/remove-tree! root)))))
+
+(deftest recovery-never-deletes-staging-paths-a-marker-did-not-generate-test
+  "A forged or corrupted marker naming an unrelated staging path must not make
+   recovery recursively delete it."
+  (let [root (scratch)
+        {:keys [ledger-file schema-directory] :as opts} (options root)
+        victim (path/join root "unrelated")
+        victim-file (path/join victim "keep.txt")]
+    (try
+      (fs/ensure-dir! victim)
+      (fs/write-text! victim-file "keep\n")
+      (fs/ensure-dir! schema-directory)
+      (fs/write-text! (init-marker-path schema-directory)
+                      (str (pr-str {:sol.clio/init-pending true
+                                    :phase :publishing
+                                    :ledger-file ledger-file
+                                    :schema-directory schema-directory
+                                    :staging-ledger victim-file
+                                    :staging-schema victim
+                                    :schema/root "forged"})
+                           "\n"))
+      (store/open! (assoc opts :initialize? true))
+      (is (= "keep\n" (fs/read-text victim-file)) "unrelated directory is never removed")
+      (finally (fs/remove-tree! root)))))
+
+(deftest file-identity-is-lossless-test
+  "Device/inode identities keep full 64-bit precision (bigint stats)."
+  (let [root (scratch)
+        p (path/join root "f")]
+    (try
+      (fs/ensure-dir! root)
+      (fs/write-text! p "x")
+      (let [st (.statSync node-fs p #js {:bigint true})]
+        (is (= {:dev (str (.-dev st)) :ino (str (.-ino st))}
+               (exclusive-fs/file-identity p))))
+      (finally (fs/remove-tree! root)))))
+
+(deftest trailing-separator-schema-path-keeps-lock-and-staging-beside-it-test
+  (let [root (scratch)
+        {:keys [ledger-file schema-directory]} (options root)
+        opts {:ledger-file ledger-file :schema-directory (str schema-directory "/")}]
+    (try
+      (let [canonical-store (store/open! (assoc opts :initialize? true))]
+        (is (= [] (store/events canonical-store)) "initialization succeeds")
+        (is (fs/exists? (init-lock-path schema-directory)) "lock is a sibling")
+        (is (= [] (filterv #(str/starts-with? % ".") (fs/list-files schema-directory)))
+            "nothing Sol-private is left inside the schema directory"))
+      (finally (fs/remove-tree! root)))))
+
+(deftest pre-existing-empty-schema-directory-is-never-adopted-test
+  "An empty schema directory Sol did not claim is refused, not deleted."
+  (let [root (scratch)
+        {:keys [ledger-file schema-directory] :as opts} (options root)]
+    (try
+      (fs/ensure-dir! schema-directory)
+      (let [identity (exclusive-fs/file-identity schema-directory)]
+        (is (thrown? js/Error (store/open! opts)) "reopen refuses empty history")
+        (is (= identity (exclusive-fs/file-identity schema-directory)) "reopen kept it")
+        (is (thrown-with-msg? cljs.core/ExceptionInfo #"fresh storage epoch"
+              (store/open! (assoc opts :initialize? true))))
+        (is (= identity (exclusive-fs/file-identity schema-directory)) "initialize kept it")
+        (is (not (fs/exists? ledger-file))))
+      (finally (fs/remove-tree! root)))))
+
+(deftest recovery-cleanup-failure-keeps-the-marker-test
+  "If recovery cannot remove an owned artifact, it fails without clearing the
+   marker, so the next start can still recover."
+  (let [root (scratch)
+        {:keys [ledger-file schema-directory] :as opts} (options root)
+        original-delete fs/delete-if-exists!]
+    (try
+      (fs/ensure-dir! (path/dirname ledger-file))
+      (fs/write-text! ledger-file "")
+      (fs/ensure-dir! schema-directory)
+      (fs/write-text! (init-marker-path schema-directory)
+                      (str (pr-str {:sol.clio/init-pending true
+                                    :phase :publishing
+                                    :ledger-file ledger-file
+                                    :schema-directory schema-directory
+                                    :schema/root "deadroot"
+                                    :ledger-identity (exclusive-fs/file-identity ledger-file)})
+                           "\n"))
+      (with-redefs [fs/delete-if-exists! (fn [p]
+                                           (if (= p ledger-file)
+                                             (throw (ex-info "unlink failed" {}))
+                                             (original-delete p)))]
+        (is (thrown-with-msg? cljs.core/ExceptionInfo #"unlink failed"
+              (store/open! (assoc opts :initialize? true)))))
+      (is (fs/exists? (init-marker-path schema-directory)) "recovery evidence kept")
+      (let [canonical-store (store/open! (assoc opts :initialize? true))]
+        (is (= [] (store/events canonical-store)) "next start recovers"))
+      (finally (fs/remove-tree! root)))))
