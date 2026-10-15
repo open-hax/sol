@@ -1177,7 +1177,7 @@
       (finally (fs/remove-tree! root)))))
 
 (deftest file-identity-is-lossless-test
-  "Device/inode identities keep full 64-bit precision (bigint stats)."
+  ;; Device/inode identities keep full 64-bit precision (bigint stats).
   (let [root (scratch)
         p (path/join root "f")]
     (try
@@ -1201,7 +1201,7 @@
       (finally (fs/remove-tree! root)))))
 
 (deftest pre-existing-empty-schema-directory-is-never-adopted-test
-  "An empty schema directory Sol did not claim is refused, not deleted."
+  ;; An empty schema directory Sol did not claim is refused, not deleted.
   (let [root (scratch)
         {:keys [ledger-file schema-directory] :as opts} (options root)]
     (try

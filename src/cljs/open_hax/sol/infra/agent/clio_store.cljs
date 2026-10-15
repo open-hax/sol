@@ -70,12 +70,30 @@
   [schema-directory]
   (str (init-marker-path schema-directory) ".tmp"))
 
+(defn- sibling-path
+  "A path beside p: suffix appended to the resolved path, so a configured
+   trailing separator can never place it inside p."
+  [p suffix]
+  (str (path/resolve p) suffix))
+
 (defn- init-lock-path
   "Permanent sibling lock file (never inside schema-directory, never deleted).
    Every initialization and every recovery holds it, so a claim that exists
    while it is free belongs to a dead process."
   [schema-directory]
-  (str schema-directory ".sol-clio-lock"))
+  (sibling-path schema-directory ".sol-clio-lock"))
+
+(defn- init-claim-path
+  "Sibling ownership evidence written (under the init lock) just before the
+   exclusive mkdir and removed once the in-directory marker exists. Only a
+   markerless empty directory with this evidence is a crashed Sol claim."
+  [schema-directory]
+  (sibling-path schema-directory ".sol-clio-claim"))
+
+(defn- clear-init-claim!
+  [schema-directory]
+  (attempt-cleanup! #(fs/delete-if-exists! (str (init-claim-path schema-directory) ".tmp")))
+  (attempt-cleanup! #(fs/delete-if-exists! (init-claim-path schema-directory))))
 
 (defn- with-init-lock
   "Run f holding the init lock. Initialization waits for a live peer so it can
@@ -104,10 +122,15 @@
    (init-marker-path schema-directory)
    (str (pr-str marker) "\n")))
 
+(defn- clear-init-marker-strict!
+  "Remove the marker (tmp first); failures propagate."
+  [schema-directory]
+  (fs/delete-if-exists! (init-marker-tmp-path schema-directory))
+  (fs/delete-if-exists! (init-marker-path schema-directory)))
+
 (defn- clear-init-marker!
   [schema-directory]
-  (attempt-cleanup! #(fs/delete-if-exists! (init-marker-tmp-path schema-directory)))
-  (attempt-cleanup! #(fs/delete-if-exists! (init-marker-path schema-directory))))
+  (attempt-cleanup! #(clear-init-marker-strict! schema-directory)))
 
 (defn- read-init-marker
   "Return the pending-init map when present and well-formed; otherwise nil."
@@ -134,12 +157,31 @@
         current (exclusive-fs/file-identity ledger-file)]
     (boolean (and recorded current (= recorded current)))))
 
+(defn- generated-staging?
+  "True only for the `<configured>.init-<id>` sibling form initialize!
+   generates, so a corrupted or forged marker can never aim a (recursive)
+   delete at an unrelated path."
+  [configured staging]
+  (boolean
+   (when (and (string? configured) (string? staging))
+     (let [base (path/resolve configured)
+           candidate (path/resolve staging)
+           prefix (str (path/basename base) ".init-")
+           name (path/basename candidate)]
+       (and (= (path/dirname base) (path/dirname candidate))
+            (str/starts-with? name prefix)
+            (re-matches #"[A-Za-z0-9-]+" (subs name (count prefix))))))))
+
 (defn- remove-staging!
-  [{:keys [staging-ledger staging-schema]}]
-  (when staging-ledger
-    (attempt-cleanup! #(fs/delete-if-exists! staging-ledger)))
-  (when staging-schema
-    (attempt-cleanup! #(fs/remove-tree! staging-schema))))
+  "Remove the marker's generated staging artifacts. strict? propagates
+   failures (rollback must not report success over leftovers)."
+  ([marker] (remove-staging! marker false))
+  ([{:keys [ledger-file schema-directory staging-ledger staging-schema]} strict?]
+   (let [run (if strict? (fn [f] (f)) attempt-cleanup!)]
+     (when (generated-staging? ledger-file staging-ledger)
+       (run #(fs/delete-if-exists! staging-ledger)))
+     (when (generated-staging? schema-directory staging-schema)
+       (run #(fs/remove-tree! staging-schema))))))
 
 (defn- rollback-incomplete-init!
   "Release an incomplete epoch identified by its marker while holding the
@@ -149,11 +191,13 @@
   [{:keys [ledger-file schema-directory] :as marker}]
   (when (and schema-directory (fs/exists? schema-directory)
              (empty? (schema-edn-revisions schema-directory)))
+    ;; Owned-artifact removals propagate failures and the marker is cleared
+    ;; last, so a failed cleanup keeps the recovery evidence for next start.
     (when (and ledger-file (fs/exists? ledger-file) (ledger-owned-by-marker? ledger-file marker))
-      (attempt-cleanup! #(fs/delete-if-exists! ledger-file)))
-    (remove-staging! marker)
-    (clear-init-marker! schema-directory)
-    (attempt-cleanup! #(exclusive-fs/remove-directory-if-empty! schema-directory))
+      (fs/delete-if-exists! ledger-file))
+    (remove-staging! marker true)
+    (clear-init-marker-strict! schema-directory)
+    (exclusive-fs/remove-directory-if-empty! schema-directory)
     :rolled-back))
 
 (defn- resume-incomplete-init!
@@ -162,7 +206,7 @@
    and a staged revision. Returns :resumed when the schema commit completes."
   [{:keys [ledger-file schema-directory staging-schema]
     root :schema/root :as marker}]
-  (let [staging-revision (when (and staging-schema root)
+  (let [staging-revision (when (and root (generated-staging? schema-directory staging-schema))
                            (schema-store/revision-path staging-schema root))
         target (when root (schema-store/revision-path schema-directory root))]
     (when (and ledger-file (fs/exists? ledger-file)
@@ -180,11 +224,13 @@
 
 (defn- recover-markerless-empty-claim!
   "A crash between the exclusive mkdir and the first marker rename leaves a
-   schema directory holding nothing but (at most) the marker's tmp body, and
-   no ledger. Under the init lock that claim is dead: remove it so initialize
-   can retry."
+   schema directory holding nothing but (at most) the marker's tmp body, no
+   ledger, and the sibling claim evidence. Under the init lock that claim is
+   dead: remove it so initialize can retry. Without the evidence an empty
+   directory is not Sol's and is never removed."
   [ledger-file schema-directory]
-  (when (and (fs/exists? schema-directory)
+  (when (and (fs/exists? (init-claim-path schema-directory))
+             (fs/exists? schema-directory)
              (not (fs/exists? (init-marker-path schema-directory)))
              (not (fs/exists? ledger-file))
              (every? #{(path/basename (init-marker-tmp-path schema-directory))}
@@ -193,11 +239,7 @@
     (attempt-cleanup! #(exclusive-fs/remove-directory-if-empty! schema-directory))
     :rolled-back))
 
-(defn- recover-incomplete-initialization!
-  "Caller holds the init lock, so no live initializer can be disturbed and a
-   marker cannot vanish mid-decision. Resume when the ledger was published,
-   or roll back when it was not / cannot be completed. Returns :resumed,
-   :rolled-back, or nil."
+(defn- recover-marked-initialization!
   [ledger-file schema-directory]
   (or (recover-markerless-empty-claim! ledger-file schema-directory)
       ;; An empty/partial marker (only an older truncate-and-rewrite writer
@@ -226,6 +268,17 @@
           :else
           (or (resume-incomplete-init! marker)
               (rollback-incomplete-init! marker))))))
+
+(defn- recover-incomplete-initialization!
+  "Caller holds the init lock, so no live initializer can be disturbed and a
+   marker cannot vanish mid-decision. Resume when the ledger was published,
+   or roll back when it was not / cannot be completed. Returns :resumed,
+   :rolled-back, or nil."
+  [ledger-file schema-directory]
+  (let [recovery (recover-marked-initialization! ledger-file schema-directory)]
+    ;; Under the init lock any claim evidence is stale (its writer is gone).
+    (clear-init-claim! schema-directory)
+    recovery))
 
 (defn- missing-schema-history! []
   (throw (ex-info "Explicit Clio schema history is missing" {})))
@@ -303,8 +356,8 @@
   (when (or (fs/exists? ledger-file) (fs/exists? schema-directory))
     (fresh-epoch-required!))
   (let [attempt (random-uuid)
-        staging-ledger (str ledger-file ".init-" attempt)
-        staging-schema (str schema-directory ".init-" attempt)
+        staging-ledger (sibling-path ledger-file (str ".init-" attempt))
+        staging-schema (sibling-path schema-directory (str ".init-" attempt))
         claim {:sol.clio/init-pending true
                :ledger-file ledger-file
                :schema-directory schema-directory
@@ -315,6 +368,8 @@
         schema-claimed? (atom false)
         ledger-published? (atom false)]
     (try
+      (exclusive-fs/replace-file! (init-claim-path schema-directory)
+                                  (str (pr-str {:sol.clio/claim (path/resolve schema-directory)}) "\n"))
       (try
         (exclusive-fs/create-directory! schema-directory #(reset! schema-claimed? true))
         (catch :default error
@@ -322,6 +377,7 @@
             (fresh-epoch-required!)
             (throw error))))
       (write-init-marker! schema-directory (assoc claim :phase :claimed))
+      (clear-init-claim! schema-directory)
       (exclusive-fs/create-directory! staging-schema #(reset! staging-schema? true))
       (fs/ensure-dir! (path/dirname ledger-file))
       (exclusive-fs/create-file! staging-ledger #(reset! staging-ledger? true))
@@ -358,6 +414,7 @@
         (when @schema-claimed?
           (clear-init-marker! schema-directory)
           (attempt-cleanup! #(exclusive-fs/remove-directory-if-empty! schema-directory)))
+        (clear-init-claim! schema-directory)
         (throw error)))))
 
 
@@ -374,10 +431,10 @@
    initialization may be on disk, so ordinary reopens never create the lock
    file (read-only or legacy parents keep working)."
   [schema-directory]
-  (and (fs/exists? schema-directory)
-       (or (fs/exists? (init-marker-path schema-directory))
-           (fs/exists? (init-marker-tmp-path schema-directory))
-           (empty? (fs/list-files schema-directory)))))
+  (or (fs/exists? (init-claim-path schema-directory))
+      (and (fs/exists? schema-directory)
+           (or (fs/exists? (init-marker-path schema-directory))
+               (fs/exists? (init-marker-tmp-path schema-directory))))))
 
 (defn- open-under-init-lock!
   [ledger-file schema-directory initialize?]
@@ -417,7 +474,7 @@
   (cond
     initialize?
     (do (require-unnested! ledger-file schema-directory)
-        (fs/ensure-dir! (path/dirname schema-directory))
+        (fs/ensure-dir! (path/dirname (path/resolve schema-directory)))
         (with-init-lock schema-directory
           #(open-under-init-lock! ledger-file schema-directory true)))
 

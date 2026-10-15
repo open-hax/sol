@@ -99,11 +99,13 @@
 
 (defn file-identity
   "Return {:dev :ino} for an existing path, or nil if missing. Used to prove
-   a published ledger is still the same inode as the staged file."
+   a published ledger is still the same inode as the staged file. Read as
+   bigint stats and kept as decimal strings, so 64-bit device/inode values
+   above Number.MAX_SAFE_INTEGER never round into a false match."
   [p]
   (try
-    (let [st (.statSync node-fs (str p))]
-      {:dev (.-dev st) :ino (.-ino st)})
+    (let [st (.statSync node-fs (str p) #js {:bigint true})]
+      {:dev (str (.-dev st)) :ino (str (.-ino st))})
     (catch :default _ nil)))
 
 (defn same-file-identity?
