@@ -88,14 +88,19 @@
 
 (defn remove-directory-if-empty!
   "Release a claimed directory with non-recursive `rmdir`: it succeeds only
-   when the directory is empty, atomically, so any child another process
-   placed there (nested history, a foreign ledger, a temp snapshot) keeps the
-   directory and its contents in place. Returns p."
+   when the directory is empty. Expected outcomes are returned as keywords
+   (`:removed`, `:missing`, `:not-empty`); any other host failure propagates
+   so callers can keep recovery evidence instead of reporting success."
   [p]
   (try
     (.rmdirSync node-fs (str p))
-    (catch :default _ nil))
-  p)
+    :removed
+    (catch :default error
+      (let [code (.-code error)]
+        (cond
+          (= "ENOENT" code) :missing
+          (or (= "ENOTEMPTY" code) (= "EEXIST" code)) :not-empty
+          :else (throw error))))))
 
 (defn file-identity
   "Return {:dev :ino} for an existing path, or nil if missing. Used to prove
@@ -156,6 +161,10 @@
       (try (.flockSync fse fd (.-LOCK_UN constants)) (catch :default _ nil))
       (try (.closeSync node-fs fd) (catch :default _ nil)))))
 
+(defn append-lock-path
+  "Permanent sibling lock serializing ledger appends against empty-unlink."
+  [p]
+  (str p ".sol-append-lock"))
 
 (defn- fsync-directory!
   "Best-effort durability for a rename inside dir (POSIX); hosts that cannot
@@ -181,24 +190,53 @@
     (fsync-directory! (.dirname node-path (str p))))
   p)
 
+(defn rename-path!
+  "Rename `from` onto `to`. If `to` already exists, throw shaped
+   `:already-exists` without removing `from`, so a concurrent empty directory
+   is never replaced. Returns to."
+  [from to]
+  (when (try (.statSync node-fs (str to)) true
+             (catch :default _ false))
+    (throw (ex-info "Exclusive rename target already exists"
+                    {:exclusive-fs/error :already-exists
+                     :path (str to)})))
+  (try
+    (.renameSync node-fs (str from) (str to))
+    (catch :default error
+      (if (= "EEXIST" (.-code error))
+        (throw (ex-info "Exclusive rename target already exists"
+                        {:exclusive-fs/error :already-exists
+                         :path (str to)}))
+        (throw error))))
+  (fsync-directory! (.dirname node-path (str to)))
+  to)
+
 (defn unlink-if-empty!
-  "Unpublish p only while its inode is still empty. p is first hard-linked
-   to a private `<p>.unpublish-<uuid>` name and unlinked, so the inode stays
-   reachable; if it then holds any bytes (another opener appended), it is
-   linked back to p and kept. Returns :removed, :kept, :kept-aside (p was
-   re-created meanwhile; the bytes stay at the private name) or :missing."
+  "Unpublish p only while its inode is still empty and no appender holds the
+   sibling append lock. The lock is taken before the public name is removed so
+   a cooperating writer cannot append after the emptiness check; if the lock
+   is busy the file is left untouched (`:busy`). Under the lock p is
+   hard-linked aside, unlinked, and either destroyed while empty or linked
+   back when it holds bytes. Returns :removed, :kept, :kept-aside, :missing,
+   or :busy."
   [p]
-  (let [hold (str p ".unpublish-" (random-uuid))]
-    (if-not (try (.linkSync node-fs (str p) hold) true
-                 (catch :default error
-                   (if (= "ENOENT" (.-code error)) false (throw error))))
-      :missing
-      (do
-        (.unlinkSync node-fs (str p))
-        (if (pos? (.-size (.statSync node-fs hold)))
-          (if (try (.linkSync node-fs hold (str p)) true
-                   (catch :default error
-                     (if (= "EEXIST" (.-code error)) false (throw error))))
-            (do (.unlinkSync node-fs hold) :kept)
-            :kept-aside)
-          (do (.unlinkSync node-fs hold) :removed))))))
+  (let [hold (str p ".unpublish-" (random-uuid))
+        lock-path (append-lock-path p)]
+    (if-let [lock (try-lock-file! lock-path)]
+      (try
+        (if-not (try (.linkSync node-fs (str p) hold) true
+                     (catch :default error
+                       (if (= "ENOENT" (.-code error)) false (throw error))))
+          :missing
+          (do
+            (.unlinkSync node-fs (str p))
+            (if (pos? (.-size (.statSync node-fs hold)))
+              (if (try (.linkSync node-fs hold (str p)) true
+                       (catch :default error
+                         (if (= "EEXIST" (.-code error)) false (throw error))))
+                (do (.unlinkSync node-fs hold) :kept)
+                :kept-aside)
+              (do (.unlinkSync node-fs hold) :removed))))
+        (finally
+          (release-lock! lock)))
+      :busy)))

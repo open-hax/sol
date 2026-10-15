@@ -91,29 +91,40 @@
   (sibling-path schema-directory ".sol-clio-claim"))
 
 (defn- write-init-claim!
-  "Record the identity of the directory this attempt just created."
-  [schema-directory]
-  (exclusive-fs/replace-file!
-   (init-claim-path schema-directory)
-   (str (pr-str {:sol.clio/claim (path/resolve schema-directory)
-                 :identity (exclusive-fs/file-identity schema-directory)})
-        "\n")))
+  "Record the identity of the directory this attempt owns. `identity-of` is
+   the path whose inode to bind (the live directory, possibly a private
+   staging name that will be renamed onto schema-directory)."
+  ([schema-directory] (write-init-claim! schema-directory schema-directory))
+  ([schema-directory identity-of]
+   (exclusive-fs/replace-file!
+    (init-claim-path schema-directory)
+    (str (pr-str {:sol.clio/claim (path/resolve schema-directory)
+                  :identity (exclusive-fs/file-identity identity-of)})
+         "\n"))))
+
+(defn- read-claim-data
+  "Parse a claim body when present and well-formed; otherwise nil."
+  [claim-path]
+  (when (fs/exists? claim-path)
+    (try
+      (let [data (reader/read-string (fs/read-text claim-path))]
+        (when (map? data) data))
+      (catch :default _ nil))))
 
 (defn- claim-proves-ownership?
-  "True only when the claim evidence names this directory and its current
-   filesystem identity (so it was written after Sol's own mkdir)."
+  "True when claim evidence (the durable file or its replace-file! `.tmp`)
+   names this directory and its current filesystem identity. Accepting the
+   temporary ownership record covers a crash after the body was fsynced but
+   before the final rename."
   [schema-directory]
-  (let [claim (init-claim-path schema-directory)]
+  (let [claim (init-claim-path schema-directory)
+        data (or (read-claim-data claim) (read-claim-data (str claim ".tmp")))
+        current (exclusive-fs/file-identity schema-directory)]
     (boolean
-     (when (fs/exists? claim)
-       (try
-         (let [data (reader/read-string (fs/read-text claim))
-               current (exclusive-fs/file-identity schema-directory)]
-           (and (map? data)
-                (= (path/resolve schema-directory) (:sol.clio/claim data))
-                current
-                (= current (:identity data))))
-         (catch :default _ false))))))
+     (and data
+          (= (path/resolve schema-directory) (:sol.clio/claim data))
+          current
+          (= current (:identity data))))))
 
 (defn- clear-init-claim!
   [schema-directory]
@@ -212,7 +223,9 @@
   "Release an incomplete epoch identified by its marker while holding the
    init lock. Safe only while the schema directory holds no revision
    snapshots. The ledger is deleted only when its inode matches the marker's
-   recorded identity; otherwise it is preserved."
+   recorded identity; otherwise it is preserved. Claim evidence is retained
+   until the schema directory is actually removed, so a transient rmdir
+   failure stays recoverable."
   [{:keys [ledger-file schema-directory] :as marker}]
   (when (and schema-directory (fs/exists? schema-directory)
              (empty? (schema-edn-revisions schema-directory)))
@@ -221,8 +234,13 @@
     (when (and ledger-file (fs/exists? ledger-file) (ledger-owned-by-marker? ledger-file marker))
       (exclusive-fs/unlink-if-empty! ledger-file))
     (remove-staging! marker true)
+    ;; Ensure claim evidence survives the marker→rmdir window.
+    (when-not (claim-proves-ownership? schema-directory)
+      (write-init-claim! schema-directory))
     (clear-init-marker-strict! schema-directory)
-    (exclusive-fs/remove-directory-if-empty! schema-directory)
+    (let [removed (exclusive-fs/remove-directory-if-empty! schema-directory)]
+      (when (= :removed removed)
+        (clear-init-claim! schema-directory)))
     :rolled-back))
 
 (defn- resume-incomplete-init!
@@ -247,6 +265,15 @@
       (remove-staging! marker)
       :resumed)))
 
+(defn- promote-claim-tmp!
+  "When only the replace-file! temporary ownership record remains, promote it
+   to the durable claim path so markerless recovery can prove ownership."
+  [schema-directory]
+  (let [claim (init-claim-path schema-directory)
+        tmp (str claim ".tmp")]
+    (when (and (not (fs/exists? claim)) (fs/exists? tmp) (claim-proves-ownership? schema-directory))
+      (attempt-cleanup! #(exclusive-fs/rename-path! tmp claim)))))
+
 (defn- recover-markerless-empty-claim!
   "A crash between the exclusive mkdir and the first marker rename leaves a
    schema directory holding nothing but (at most) the marker's tmp body, no
@@ -255,6 +282,7 @@
    retry. Without matching evidence an empty directory is not Sol's and is
    never removed."
   [ledger-file schema-directory]
+  (promote-claim-tmp! schema-directory)
   (when (and (fs/exists? schema-directory)
              (claim-proves-ownership? schema-directory)
              (not (fs/exists? (init-marker-path schema-directory)))
@@ -262,7 +290,9 @@
              (every? #{(path/basename (init-marker-tmp-path schema-directory))}
                      (fs/list-files schema-directory)))
     (clear-init-marker! schema-directory)
-    (attempt-cleanup! #(exclusive-fs/remove-directory-if-empty! schema-directory))
+    (let [removed (exclusive-fs/remove-directory-if-empty! schema-directory)]
+      (when (= :removed removed)
+        (clear-init-claim! schema-directory)))
     :rolled-back))
 
 (defn- recover-marked-initialization!
@@ -295,15 +325,33 @@
           (or (resume-incomplete-init! marker)
               (rollback-incomplete-init! marker))))))
 
+(defn- clear-orphan-creating-dirs!
+  "Remove empty `<schema>.creating-*` siblings left by a crash before the
+   exclusive rename onto the configured schema directory."
+  [schema-directory]
+  (let [resolved (path/resolve schema-directory)
+        parent (path/dirname resolved)
+        prefix (str (path/basename resolved) ".creating-")]
+    (doseq [name (fs/list-files parent)]
+      (when (str/starts-with? name prefix)
+        (attempt-cleanup! #(exclusive-fs/remove-directory-if-empty!
+                            (path/join parent name)))))))
+
 (defn- recover-incomplete-initialization!
   "Caller holds the init lock, so no live initializer can be disturbed and a
    marker cannot vanish mid-decision. Resume when the ledger was published,
    or roll back when it was not / cannot be completed. Returns :resumed,
    :rolled-back, or nil."
   [ledger-file schema-directory]
+  (clear-orphan-creating-dirs! schema-directory)
   (let [recovery (recover-marked-initialization! ledger-file schema-directory)]
-    ;; Under the init lock any claim evidence is stale (its writer is gone).
-    (clear-init-claim! schema-directory)
+    ;; Drop claim evidence only when the schema directory is gone or the
+    ;; epoch was resumed (committed history no longer needs the claim).
+    (when (or (not (fs/exists? schema-directory))
+              (= :resumed recovery)
+              (seq (when (fs/exists? schema-directory)
+                     (schema-edn-revisions schema-directory))))
+      (clear-init-claim! schema-directory))
     recovery))
 
 (defn- missing-schema-history! []
@@ -394,16 +442,23 @@
         schema-claimed? (atom false)
         ledger-published? (atom false)]
     (try
-      (try
-        ;; Claim evidence is written only after our own mkdir, bound to the
-        ;; created directory's identity.
-        (exclusive-fs/create-directory! schema-directory
-                                        #(do (reset! schema-claimed? true)
-                                             (write-init-claim! schema-directory)))
-        (catch :default error
-          (if (= :already-exists (:exclusive-fs/error (ex-data error)))
-            (fresh-epoch-required!)
-            (throw error))))
+      ;; Create under a private sibling, bind claim evidence to that inode,
+      ;; then rename onto the configured path so a crash never leaves the
+      ;; public directory without recoverable ownership evidence.
+      (let [creating (sibling-path schema-directory (str ".creating-" attempt))]
+        (try
+          (exclusive-fs/create-directory! creating
+                                          #(do (reset! schema-claimed? true)
+                                               (write-init-claim! schema-directory creating)))
+          (exclusive-fs/rename-path! creating schema-directory)
+          (catch :default error
+            (attempt-cleanup! #(exclusive-fs/remove-directory-if-empty! creating))
+            (when @schema-claimed?
+              (clear-init-claim! schema-directory)
+              (reset! schema-claimed? false))
+            (if (= :already-exists (:exclusive-fs/error (ex-data error)))
+              (fresh-epoch-required!)
+              (throw error)))))
       (write-init-marker! schema-directory (assoc claim :phase :claimed))
       (clear-init-claim! schema-directory)
       (exclusive-fs/create-directory! staging-schema #(reset! staging-schema? true))
@@ -443,9 +498,14 @@
         (when @staging-schema?
           (attempt-cleanup! #(fs/remove-tree! staging-schema)))
         (when @schema-claimed?
+          (when-not (claim-proves-ownership? schema-directory)
+            (attempt-cleanup! #(write-init-claim! schema-directory)))
           (clear-init-marker! schema-directory)
-          (attempt-cleanup! #(exclusive-fs/remove-directory-if-empty! schema-directory)))
-        (clear-init-claim! schema-directory)
+          (attempt-cleanup! #(exclusive-fs/remove-directory-if-empty! schema-directory))
+          (when-not (fs/exists? schema-directory)
+            (clear-init-claim! schema-directory)))
+        (when-not (fs/exists? schema-directory)
+          (clear-init-claim! schema-directory))
         (throw error)))))
 
 
@@ -462,10 +522,16 @@
    initialization may be on disk, so ordinary reopens never create the lock
    file (read-only or legacy parents keep working)."
   [schema-directory]
-  (or (fs/exists? (init-claim-path schema-directory))
-      (and (fs/exists? schema-directory)
-           (or (fs/exists? (init-marker-path schema-directory))
-               (fs/exists? (init-marker-tmp-path schema-directory))))))
+  (let [claim (init-claim-path schema-directory)
+        resolved (path/resolve schema-directory)
+        parent (path/dirname resolved)
+        creating-prefix (str (path/basename resolved) ".creating-")]
+    (or (fs/exists? claim)
+        (fs/exists? (str claim ".tmp"))
+        (some #(str/starts-with? % creating-prefix) (fs/list-files parent))
+        (and (fs/exists? schema-directory)
+             (or (fs/exists? (init-marker-path schema-directory))
+                 (fs/exists? (init-marker-tmp-path schema-directory)))))))
 
 (defn- open-under-init-lock!
   [ledger-file schema-directory initialize?]
@@ -518,12 +584,19 @@
     (reopen! ledger-file schema-directory)))
 
 (defn append!
-  "Delegate exact-event admission to Clio; preserve constructed data on retries."
+  "Delegate exact-event admission to Clio; preserve constructed data on retries.
+   Holds the ledger append lock so unlink-if-empty! cannot destroy the inode
+   while this writer may still append."
   [store event]
   (when-not store
     (throw (ex-info "Clio filesystem store not configured" {})))
-  (let [runtime (runtime/refresh (:runtime store))]
-    (ledger/append-event! (:schema/revisions runtime) (:ledger-file store) event)))
+  (let [runtime (runtime/refresh (:runtime store))
+        lock (exclusive-fs/lock-file!
+              (exclusive-fs/append-lock-path (:ledger-file store)))]
+    (try
+      (ledger/append-event! (:schema/revisions runtime) (:ledger-file store) event)
+      (finally
+        (exclusive-fs/release-lock! lock)))))
 
 (defn events
   "Read validated, complete canonical history, never a forgiving local parser."
