@@ -1331,11 +1331,11 @@
       (finally (fs/remove-tree! root)))))
 
 (deftest claim-tmp-ownership-record-recovers-markerless-empty-directory-test
-  "A crash after the claim body is fsynced but before replace-file! renames
-   it leaves only `.sol-clio-claim.tmp`; recovery must accept that temporary
-   ownership record and release the empty directory."
+  ;; Crash after claim body fsync but before replace-file! rename leaves only
+  ;; `.sol-clio-claim.tmp`; recovery must accept that temporary ownership
+  ;; record and release the empty directory.
   (let [root (scratch)
-        {:keys [ledger-file schema-directory] :as opts} (options root)
+        {:keys [schema-directory] :as opts} (options root)
         claim (str (path/resolve schema-directory) ".sol-clio-claim")
         claim-tmp (str claim ".tmp")]
     (try
@@ -1351,7 +1351,7 @@
       (finally (fs/remove-tree! root)))))
 
 (deftest unlink-if-empty-leaves-nonempty-ledger-at-public-path-test
-  "A nonempty ledger must never leave its public path during unpublish."
+  ;; A nonempty ledger must never leave its public path during unpublish.
   (let [root (scratch)
         ledger (path/join root "events.edn")
         body "{:kept true}\n"]
@@ -1367,7 +1367,7 @@
       (finally (fs/remove-tree! root)))))
 
 (deftest recovery-marker-matches-trailing-separator-path-spellings-test
-  "Marker paths recorded with a trailing separator still match on recovery."
+  ;; Marker paths recorded with a trailing separator still match on recovery.
   (let [root (scratch)
         {:keys [ledger-file schema-directory] :as opts} (options root)]
     (try
