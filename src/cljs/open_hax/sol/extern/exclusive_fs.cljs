@@ -30,8 +30,8 @@
    already exist and an existing path (even an empty directory) fails without
    calling `on-created`. EEXIST is shaped as `{:exclusive-fs/error
    :already-exists}` so callers never read Node `.code`. `on-created` runs
-   only once this call has created the directory, so the caller can roll back
-   exactly what it owns. Returns p."
+   only once this call has created the directory; if it throws the directory
+   is removed so a failed claim never leaves a public empty path. Returns p."
   [p on-created]
   (try
     (.mkdirSync node-fs (str p))
@@ -41,7 +41,11 @@
                         {:exclusive-fs/error :already-exists
                          :path (str p)}))
         (throw error))))
-  (on-created)
+  (try
+    (on-created)
+    (catch :default error
+      (try (.rmdirSync node-fs (str p)) (catch :default _ nil))
+      (throw error)))
   p)
 
 (defn link-new!
@@ -191,52 +195,51 @@
   p)
 
 (defn rename-path!
-  "Rename `from` onto `to`. If `to` already exists, throw shaped
-   `:already-exists` without removing `from`, so a concurrent empty directory
-   is never replaced. Returns to."
+  "Rename `from` onto `to` only when `to` is absent. Used for promoting a
+   durable claim.tmp body; directory publication uses exclusive mkdir instead
+   of rename, so this never publishes a schema directory."
   [from to]
   (when (try (.statSync node-fs (str to)) true
              (catch :default _ false))
     (throw (ex-info "Exclusive rename target already exists"
                     {:exclusive-fs/error :already-exists
                      :path (str to)})))
-  (try
-    (.renameSync node-fs (str from) (str to))
-    (catch :default error
-      (if (= "EEXIST" (.-code error))
-        (throw (ex-info "Exclusive rename target already exists"
-                        {:exclusive-fs/error :already-exists
-                         :path (str to)}))
-        (throw error))))
+  (.renameSync node-fs (str from) (str to))
   (fsync-directory! (.dirname node-path (str to)))
   to)
 
 (defn unlink-if-empty!
   "Unpublish p only while its inode is still empty and no appender holds the
-   sibling append lock. The lock is taken before the public name is removed so
-   a cooperating writer cannot append after the emptiness check; if the lock
-   is busy the file is left untouched (`:busy`). Under the lock p is
-   hard-linked aside, unlinked, and either destroyed while empty or linked
-   back when it holds bytes. Returns :removed, :kept, :kept-aside, :missing,
-   or :busy."
+   sibling append lock. Under the lock the size is checked while p still
+   exists: a nonempty ledger is left at p (`:kept`). Only an empty file is
+   hard-linked aside and removed; if bytes appear on the hold it is linked
+   back. If the lock is busy the file is left untouched (`:busy`). Returns
+   :removed, :kept, :kept-aside, :missing, or :busy."
   [p]
   (let [hold (str p ".unpublish-" (random-uuid))
         lock-path (append-lock-path p)]
     (if-let [lock (try-lock-file! lock-path)]
       (try
-        (if-not (try (.linkSync node-fs (str p) hold) true
-                     (catch :default error
-                       (if (= "ENOENT" (.-code error)) false (throw error))))
-          :missing
-          (do
-            (.unlinkSync node-fs (str p))
-            (if (pos? (.-size (.statSync node-fs hold)))
-              (if (try (.linkSync node-fs hold (str p)) true
-                       (catch :default error
-                         (if (= "EEXIST" (.-code error)) false (throw error))))
-                (do (.unlinkSync node-fs hold) :kept)
-                :kept-aside)
-              (do (.unlinkSync node-fs hold) :removed))))
+        (let [st (try (.statSync node-fs (str p))
+                      (catch :default error
+                        (if (= "ENOENT" (.-code error)) nil (throw error))))]
+          (cond
+            (nil? st) :missing
+            (pos? (.-size st)) :kept
+            :else
+            (if-not (try (.linkSync node-fs (str p) hold) true
+                         (catch :default error
+                           (if (= "ENOENT" (.-code error)) false (throw error))))
+              :missing
+              (do
+                (.unlinkSync node-fs (str p))
+                (if (pos? (.-size (.statSync node-fs hold)))
+                  (if (try (.linkSync node-fs hold (str p)) true
+                           (catch :default error
+                             (if (= "EEXIST" (.-code error)) false (throw error))))
+                    (do (.unlinkSync node-fs hold) :kept)
+                    :kept-aside)
+                  (do (.unlinkSync node-fs hold) :removed))))))
         (finally
           (release-lock! lock)))
       :busy)))

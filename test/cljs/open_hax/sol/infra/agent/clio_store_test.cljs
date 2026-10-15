@@ -977,22 +977,19 @@
       (finally (fs/remove-tree! root)))))
 
 (deftest schema-directory-is-claimed-only-under-the-init-lock-test
-  "The schema directory is created (exclusive mkdir of a private sibling, then
-   rename) and marked only while the sibling init lock is held, so recovery
-   can never mistake a live claim for a crashed one. A crash at that point
-   leaves nothing a retry trips over."
+  "The schema directory is created (exclusive mkdir) and marked only while the
+   sibling init lock is held, so recovery can never mistake a live claim for
+   a crashed one. A crash at that point leaves nothing a retry trips over."
   (let [root (scratch)
         {:keys [schema-directory] :as opts} (options root)
         original-create exclusive-fs/create-directory!
-        creating-prefix (str (path/resolve schema-directory) ".creating-")
         saw (atom nil)]
     (try
       (with-redefs [exclusive-fs/create-directory!
                     (fn [p on-created]
-                      (if (str/starts-with? (str p) creating-prefix)
+                      (if (= p schema-directory)
                         (do (reset! saw {:peer-lock (exclusive-fs/try-lock-file!
-                                                     (init-lock-path schema-directory))
-                                         :creating p})
+                                                     (init-lock-path schema-directory))})
                             (exclusive-fs/release-lock! (:peer-lock @saw))
                             (throw (ex-info "crash at claim" {})))
                         (original-create p on-created)))]
@@ -1001,7 +998,6 @@
       (is (some? @saw) "schema directory claimed through exclusive create")
       (is (nil? (:peer-lock @saw)) "a peer cannot take the init lock during the claim")
       (is (not (fs/exists? schema-directory)) "claim never exposed")
-      (is (not (fs/exists? (:creating @saw))) "private creating sibling rolled back")
       (let [canonical-store (store/open! (assoc opts :initialize? true))]
         (is (= [] (store/events canonical-store))))
       (finally (fs/remove-tree! root)))))
@@ -1098,15 +1094,15 @@
    must make this attempt fail; publication never replaces that directory."
   (let [root (scratch)
         {:keys [ledger-file schema-directory] :as opts} (options root)
-        original-rename exclusive-fs/rename-path!
+        original-create exclusive-fs/create-directory!
         foreign (atom nil)]
     (try
-      (with-redefs [exclusive-fs/rename-path!
-                    (fn [from to]
-                      (when (and (= to schema-directory) (nil? @foreign))
+      (with-redefs [exclusive-fs/create-directory!
+                    (fn [p on-created]
+                      (when (nil? @foreign)
                         (fs/ensure-dir! schema-directory)
                         (reset! foreign (exclusive-fs/file-identity schema-directory)))
-                      (original-rename from to))]
+                      (original-create p on-created))]
         (is (thrown-with-msg? cljs.core/ExceptionInfo #"fresh storage epoch"
               (store/open! (assoc opts :initialize? true)))))
       (is (= @foreign (exclusive-fs/file-identity schema-directory))
@@ -1261,7 +1257,8 @@
 
 (deftest schema-publish-failure-never-unlinks-a-ledger-another-process-appended-test
   ;; The ledger is visible between its link and the schema link; an append by
-  ;; another opener in that window must survive the rollback.
+  ;; another opener in that window must survive. Staging + marker stay so
+  ;; recovery can resume the schema publish against the retained ledger.
   (let [root (scratch)
         {:keys [ledger-file schema-directory] :as opts} (options root)
         accepted "{:accepted/by \"other opener\"}\n"
@@ -1277,7 +1274,10 @@
               (store/open! (assoc opts :initialize? true)))))
       (is (and (fs/exists? ledger-file) (= accepted (fs/read-text ledger-file)))
           "the other process's accepted history is kept")
-      (is (= [] (staging-leftovers ledger-file)))
+      (is (fs/exists? (init-marker-path schema-directory))
+          "marker retained so recovery can resume against the kept ledger")
+      (is (seq (schema-staging-leftovers schema-directory))
+          "schema staging retained for resume")
       (finally (fs/remove-tree! root)))))
 
 (deftest unlink-if-empty-keeps-ledger-while-append-lock-held-test
@@ -1330,28 +1330,63 @@
         (is (= [] (store/events canonical-store)) "next start recovers"))
       (finally (fs/remove-tree! root)))))
 
-(deftest crash-after-creating-before-rename-leaves-recoverable-claim-test
-  "Claim evidence is bound to the private creating directory before the
-   public schema path appears, so a crash before rename leaves no public
-   directory and a retry still sees a fresh epoch."
+(deftest claim-tmp-ownership-record-recovers-markerless-empty-directory-test
+  "A crash after the claim body is fsynced but before replace-file! renames
+   it leaves only `.sol-clio-claim.tmp`; recovery must accept that temporary
+   ownership record and release the empty directory."
   (let [root (scratch)
-        {:keys [schema-directory] :as opts} (options root)
-        original-rename exclusive-fs/rename-path!
-        creating (atom nil)]
+        {:keys [ledger-file schema-directory] :as opts} (options root)
+        claim (str (path/resolve schema-directory) ".sol-clio-claim")
+        claim-tmp (str claim ".tmp")]
     (try
-      (with-redefs [exclusive-fs/rename-path!
-                    (fn [from to]
-                      (when (= to schema-directory)
-                        (reset! creating from)
-                        (throw (ex-info "killed before rename" {})))
-                      (original-rename from to))]
-        (is (thrown-with-msg? cljs.core/ExceptionInfo #"killed before rename"
-              (store/open! (assoc opts :initialize? true)))))
-      (is (some? @creating))
-      (is (not (fs/exists? schema-directory)) "public schema path never published")
-      (is (not (fs/exists? @creating)) "private creating sibling cleaned")
+      (fs/ensure-dir! schema-directory)
+      (fs/write-text! claim-tmp
+                      (str (pr-str {:sol.clio/claim (path/resolve schema-directory)
+                                    :identity (exclusive-fs/file-identity schema-directory)})
+                           "\n"))
       (let [canonical-store (store/open! (assoc opts :initialize? true))]
-        (is (= [] (store/events canonical-store))))
+        (is (= [] (store/events canonical-store)) "tmp claim recovered; fresh epoch")
+        (is (not (fs/exists? claim-tmp)))
+        (is (not (fs/exists? claim))))
+      (finally (fs/remove-tree! root)))))
+
+(deftest unlink-if-empty-leaves-nonempty-ledger-at-public-path-test
+  "A nonempty ledger must never leave its public path during unpublish."
+  (let [root (scratch)
+        ledger (path/join root "events.edn")
+        body "{:kept true}\n"]
+    (try
+      (fs/ensure-dir! root)
+      (fs/write-text! ledger body)
+      (is (= :kept (exclusive-fs/unlink-if-empty! ledger)))
+      (is (fs/exists? ledger) "public path retained")
+      (is (= body (fs/read-text ledger)))
+      (is (= [] (filterv #(str/starts-with? % "events.edn.unpublish-")
+                         (fs/list-files root)))
+          "no aside hold left behind")
+      (finally (fs/remove-tree! root)))))
+
+(deftest recovery-marker-matches-trailing-separator-path-spellings-test
+  "Marker paths recorded with a trailing separator still match on recovery."
+  (let [root (scratch)
+        {:keys [ledger-file schema-directory] :as opts} (options root)]
+    (try
+      (fs/ensure-dir! (path/dirname ledger-file))
+      (fs/write-text! ledger-file "")
+      (fs/ensure-dir! schema-directory)
+      (let [identity (exclusive-fs/file-identity ledger-file)]
+        (fs/write-text! (init-marker-path schema-directory)
+                        (str (pr-str {:sol.clio/init-pending true
+                                      :phase :publishing
+                                      :ledger-file (str (path/resolve ledger-file) "/")
+                                      :schema-directory (str (path/resolve schema-directory) "/")
+                                      :schema/root "deadroot"
+                                      :ledger-identity identity})
+                             "\n")))
+      (let [canonical-store (store/open! (assoc opts :initialize? true))]
+        (is (= [] (store/events canonical-store))
+            "trailing-separator marker paths recovered")
+        (is (not (fs/exists? (init-marker-path schema-directory)))))
       (finally (fs/remove-tree! root)))))
 
 (deftest stale-claim-evidence-never-adopts-a-directory-sol-did-not-create-test
