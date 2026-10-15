@@ -90,6 +90,31 @@
   [schema-directory]
   (sibling-path schema-directory ".sol-clio-claim"))
 
+(defn- write-init-claim!
+  "Record the identity of the directory this attempt just created."
+  [schema-directory]
+  (exclusive-fs/replace-file!
+   (init-claim-path schema-directory)
+   (str (pr-str {:sol.clio/claim (path/resolve schema-directory)
+                 :identity (exclusive-fs/file-identity schema-directory)})
+        "\n")))
+
+(defn- claim-proves-ownership?
+  "True only when the claim evidence names this directory and its current
+   filesystem identity (so it was written after Sol's own mkdir)."
+  [schema-directory]
+  (let [claim (init-claim-path schema-directory)]
+    (boolean
+     (when (fs/exists? claim)
+       (try
+         (let [data (reader/read-string (fs/read-text claim))
+               current (exclusive-fs/file-identity schema-directory)]
+           (and (map? data)
+                (= (path/resolve schema-directory) (:sol.clio/claim data))
+                current
+                (= current (:identity data))))
+         (catch :default _ false))))))
+
 (defn- clear-init-claim!
   [schema-directory]
   (attempt-cleanup! #(fs/delete-if-exists! (str (init-claim-path schema-directory) ".tmp")))
@@ -194,7 +219,7 @@
     ;; Owned-artifact removals propagate failures and the marker is cleared
     ;; last, so a failed cleanup keeps the recovery evidence for next start.
     (when (and ledger-file (fs/exists? ledger-file) (ledger-owned-by-marker? ledger-file marker))
-      (fs/delete-if-exists! ledger-file))
+      (exclusive-fs/unlink-if-empty! ledger-file))
     (remove-staging! marker true)
     (clear-init-marker-strict! schema-directory)
     (exclusive-fs/remove-directory-if-empty! schema-directory)
@@ -225,12 +250,13 @@
 (defn- recover-markerless-empty-claim!
   "A crash between the exclusive mkdir and the first marker rename leaves a
    schema directory holding nothing but (at most) the marker's tmp body, no
-   ledger, and the sibling claim evidence. Under the init lock that claim is
-   dead: remove it so initialize can retry. Without the evidence an empty
-   directory is not Sol's and is never removed."
+   ledger, and sibling claim evidence bound to that directory's identity.
+   Under the init lock that claim is dead: remove it so initialize can
+   retry. Without matching evidence an empty directory is not Sol's and is
+   never removed."
   [ledger-file schema-directory]
-  (when (and (fs/exists? (init-claim-path schema-directory))
-             (fs/exists? schema-directory)
+  (when (and (fs/exists? schema-directory)
+             (claim-proves-ownership? schema-directory)
              (not (fs/exists? (init-marker-path schema-directory)))
              (not (fs/exists? ledger-file))
              (every? #{(path/basename (init-marker-tmp-path schema-directory))}
@@ -368,10 +394,12 @@
         schema-claimed? (atom false)
         ledger-published? (atom false)]
     (try
-      (exclusive-fs/replace-file! (init-claim-path schema-directory)
-                                  (str (pr-str {:sol.clio/claim (path/resolve schema-directory)}) "\n"))
       (try
-        (exclusive-fs/create-directory! schema-directory #(reset! schema-claimed? true))
+        ;; Claim evidence is written only after our own mkdir, bound to the
+        ;; created directory's identity.
+        (exclusive-fs/create-directory! schema-directory
+                                        #(do (reset! schema-claimed? true)
+                                             (write-init-claim! schema-directory)))
         (catch :default error
           (if (= :already-exists (:exclusive-fs/error (ex-data error)))
             (fresh-epoch-required!)
@@ -405,8 +433,11 @@
          :ledger-file ledger-file
          :schema-directory schema-directory})
       (catch :default error
-        (when @ledger-published?
-          (attempt-cleanup! #(fs/delete-if-exists! ledger-file)))
+        ;; The ledger was visible after its link: unpublish it only while
+        ;; it is still our empty inode; an append by another opener keeps it.
+        (when (and @ledger-published?
+                   (exclusive-fs/same-file-identity? ledger-file staging-ledger))
+          (attempt-cleanup! #(exclusive-fs/unlink-if-empty! ledger-file)))
         (when @staging-ledger?
           (attempt-cleanup! #(fs/delete-if-exists! staging-ledger)))
         (when @staging-schema?

@@ -1220,7 +1220,8 @@
    marker, so the next start can still recover."
   (let [root (scratch)
         {:keys [ledger-file schema-directory] :as opts} (options root)
-        original-delete fs/delete-if-exists!]
+        original-delete fs/delete-if-exists!
+        original-unlink exclusive-fs/unlink-if-empty!]
     (try
       (fs/ensure-dir! (path/dirname ledger-file))
       (fs/write-text! ledger-file "")
@@ -1236,7 +1237,11 @@
       (with-redefs [fs/delete-if-exists! (fn [p]
                                            (if (= p ledger-file)
                                              (throw (ex-info "unlink failed" {}))
-                                             (original-delete p)))]
+                                             (original-delete p)))
+                    exclusive-fs/unlink-if-empty! (fn [p]
+                                                    (if (= p ledger-file)
+                                                      (throw (ex-info "unlink failed" {}))
+                                                      (original-unlink p)))]
         (is (thrown-with-msg? cljs.core/ExceptionInfo #"unlink failed"
               (store/open! (assoc opts :initialize? true)))))
       (is (fs/exists? (init-marker-path schema-directory)) "recovery evidence kept")

@@ -180,3 +180,25 @@
     (.renameSync node-fs tmp (str p))
     (fsync-directory! (.dirname node-path (str p))))
   p)
+
+(defn unlink-if-empty!
+  "Unpublish p only while its inode is still empty. p is first hard-linked
+   to a private `<p>.unpublish-<uuid>` name and unlinked, so the inode stays
+   reachable; if it then holds any bytes (another opener appended), it is
+   linked back to p and kept. Returns :removed, :kept, :kept-aside (p was
+   re-created meanwhile; the bytes stay at the private name) or :missing."
+  [p]
+  (let [hold (str p ".unpublish-" (random-uuid))]
+    (if-not (try (.linkSync node-fs (str p) hold) true
+                 (catch :default error
+                   (if (= "ENOENT" (.-code error)) false (throw error))))
+      :missing
+      (do
+        (.unlinkSync node-fs (str p))
+        (if (pos? (.-size (.statSync node-fs hold)))
+          (if (try (.linkSync node-fs hold (str p)) true
+                   (catch :default error
+                     (if (= "EEXIST" (.-code error)) false (throw error))))
+            (do (.unlinkSync node-fs hold) :kept)
+            :kept-aside)
+          (do (.unlinkSync node-fs hold) :removed))))))
