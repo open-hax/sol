@@ -1628,3 +1628,55 @@
       (finally
         (.chmodSync node-fs parent 0x1ed)
         (fs/remove-tree! root)))))
+
+(deftest symlink-aliases-share-one-append-lock-test
+  ;; Codex ujf5Z: the append lock is chosen from the canonical ledger path, so
+  ;; a writer reaching the ledger through a file or parent-directory symlink
+  ;; serializes with empty-unlink on the original spelling.
+  (when-not (= "win32" (.-platform js/process))
+    (let [root (scratch)
+          real-dir (path/join root "real")
+          ledger-file (path/join real-dir "events.edn")
+          file-alias (path/join root "alias.edn")
+          dir-alias (path/join root "dir-alias")]
+      (try
+        (fs/ensure-dir! real-dir)
+        (fs/write-text! ledger-file "")
+        (.symlinkSync node-fs ledger-file file-alias)
+        (.symlinkSync node-fs real-dir dir-alias)
+        (doseq [alias [file-alias (path/join dir-alias "events.edn")]]
+          (let [lock (exclusive-fs/lock-file! (exclusive-fs/append-lock-path alias))]
+            (try
+              (is (= :busy (exclusive-fs/unlink-if-empty! ledger-file))
+                  (str "an append holding the lock via " alias " blocks empty-unlink"))
+              (is (fs/exists? ledger-file))
+              (finally (exclusive-fs/release-lock! lock)))))
+        (finally (fs/remove-tree! root))))))
+
+(deftest stale-pre-mkdir-record-never-adopts-a-later-sticky-directory-test
+  ;; Codex ujf5c: a death after the pre-mkdir record but before mkdir, then
+  ;; an operator creating an empty sticky directory later, is not Sol's
+  ;; directory. The sentinel must be bound to the attempt that wrote the
+  ;; record (exact sentinel mode, same owner, created right after the record).
+  (when-not (= "win32" (.-platform js/process))
+    (doseq [mode [0x3ed 0x340]]
+      (let [root (scratch)
+            {:keys [ledger-file schema-directory] :as opts} (options root)]
+        (try
+          (fs/ensure-dir! (path/dirname schema-directory))
+          (fs/write-text! (str (path/resolve schema-directory) ".sol-clio-claim")
+                          (str (pr-str {:sol.clio/claim (path/resolve schema-directory)
+                                        :sol.clio/attempt (str (random-uuid))
+                                        :sol.clio/written-at-ms (- (js/Date.now) 60000)
+                                        :phase :pre-mkdir})
+                               "\n"))
+          (.mkdirSync node-fs schema-directory #js {:mode mode})
+          (.chmodSync node-fs schema-directory mode)
+          (is (thrown-with-msg? cljs.core/ExceptionInfo #"fresh storage epoch"
+                (store/open! (assoc opts :initialize? true)))
+              (str "operator sticky directory (mode " (.toString mode 8) ") kept"))
+          (is (fs/exists? schema-directory))
+          (is (not (fs/exists? ledger-file)))
+          (finally
+            (try (.chmodSync node-fs schema-directory 0x1ed) (catch :default _ nil))
+            (fs/remove-tree! root)))))))
