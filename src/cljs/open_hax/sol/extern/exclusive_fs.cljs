@@ -184,6 +184,21 @@
         (.closeSync node-fs fd)
         (throw error)))))
 
+(defn lock-file-unless-uncreatable!
+  "lock-file!, except that when the lock file is absent and the host refuses
+   to create it (EACCES/EPERM/EROFS: an unwritable parent), returns nil
+   instead of throwing. An unwritable parent also forbids unlinking or
+   creating entries beside the lock, so callers may proceed unlocked."
+  [p]
+  (try
+    (lock-file! p)
+    (catch :default error
+      (if (and (contains? #{"EACCES" "EPERM" "EROFS"} (.-code error))
+               (not (try (.statSync node-fs (str p)) true
+                         (catch :default _ false))))
+        nil
+        (throw error)))))
+
 (defn release-lock!
   "Unlock and close a handle from lock-file! / try-lock-file!."
   [lock]

@@ -279,6 +279,24 @@
      (when (generated-staging? schema-directory staging-schema)
        (run #(fs/remove-tree! staging-schema))))))
 
+(defn- staging-gone?
+  "True when none of the marker's generated staging artifacts remains. A
+   non-generated (forged) staging path is never deleted and never blocks."
+  [{:keys [ledger-file schema-directory staging-ledger staging-schema]}]
+  (not (or (and (generated-staging? ledger-file staging-ledger)
+                (fs/exists? staging-ledger))
+           (and (generated-staging? schema-directory staging-schema)
+                (fs/exists? staging-schema)))))
+
+(defn- finish-committed-epoch!
+  "The epoch is committed: remove the marker's staging artifacts first and
+   clear the marker (their only durable record) only once both are gone, so
+   a death or failed cleanup leaves metadata for a later recovery."
+  [schema-directory marker]
+  (remove-staging! marker)
+  (when (staging-gone? marker)
+    (clear-init-marker! schema-directory)))
+
 (defn- rollback-incomplete-init!
   "Release an incomplete epoch identified by its marker while holding the
    init lock. Safe only while the schema directory holds no revision
@@ -331,8 +349,7 @@
         (catch :default error
           (when-not (= :already-exists (:exclusive-fs/error (ex-data error)))
             (throw error))))
-      (clear-init-marker! schema-directory)
-      (remove-staging! marker)
+      (finish-committed-epoch! schema-directory marker)
       :resumed)))
 
 (defn- promote-claim-tmp!
@@ -390,8 +407,7 @@
           nil
 
           (seq (schema-edn-revisions schema-directory))
-          (do (clear-init-marker! schema-directory)
-              (remove-staging! marker)
+          (do (finish-committed-epoch! schema-directory marker)
               :resumed)
 
           :else
@@ -495,9 +511,10 @@
   (let [attempt (random-uuid)
         staging-ledger (sibling-path ledger-file (str ".init-" attempt))
         staging-schema (sibling-path schema-directory (str ".init-" attempt))
+        ;; Resolved paths: recovery must not depend on the restart's cwd.
         claim {:sol.clio/init-pending true
-               :ledger-file ledger-file
-               :schema-directory schema-directory
+               :ledger-file (path/resolve ledger-file)
+               :schema-directory (path/resolve schema-directory)
                :staging-ledger staging-ledger
                :staging-schema staging-schema}
         staging-ledger? (atom false)
@@ -533,6 +550,10 @@
       (clear-init-claim! schema-directory)
       (exclusive-fs/create-directory! staging-schema #(reset! staging-schema? true) nil)
       (fs/ensure-dir! (path/dirname ledger-file))
+      ;; Provision the permanent append lock while the parent is writable, so
+      ;; a later append never needs to create it.
+      (exclusive-fs/release-lock!
+       (exclusive-fs/lock-file! (exclusive-fs/append-lock-path ledger-file)))
       (exclusive-fs/create-file! staging-ledger #(reset! staging-ledger? true))
       (let [staged (runtime/open staging-schema lifecycle/catalog)
             root (:schema/root (:schema/current staged))
@@ -547,13 +568,17 @@
         (reset! ledger-published? true)
         (exclusive-fs/link-new! (schema-store/revision-path staging-schema root)
                                 (schema-store/revision-path schema-directory root))
-        (clear-init-marker! schema-directory)
+        ;; Committed: nothing below may unpublish the epoch. Staging goes
+        ;; first; the marker (their only record) is cleared only once both
+        ;; are gone, otherwise a later recovery finishes the cleanup.
         (reset! schema-claimed? false)
         (reset! ledger-published? false)
         (attempt-cleanup! #(fs/delete-if-exists! staging-ledger))
         (attempt-cleanup! #(fs/remove-tree! staging-schema))
         (reset! staging-ledger? false)
         (reset! staging-schema? false)
+        (when-not (or (fs/exists? staging-ledger) (fs/exists? staging-schema))
+          (attempt-cleanup! #(clear-init-marker! schema-directory)))
         {:runtime (assoc staged :schema/directory schema-directory)
          :ledger-file ledger-file
          :schema-directory schema-directory})
@@ -683,12 +708,14 @@
 (defn append!
   "Delegate exact-event admission to Clio; preserve constructed data on retries.
    Holds the ledger append lock so unlink-if-empty! cannot destroy the inode
-   while this writer may still append."
+   while this writer may still append. A legacy epoch without the lock whose
+   parent forbids creating it appends unlocked: that parent also forbids the
+   unlink the lock guards against."
   [store event]
   (when-not store
     (throw (ex-info "Clio filesystem store not configured" {})))
   (let [runtime (runtime/refresh (:runtime store))
-        lock (exclusive-fs/lock-file!
+        lock (exclusive-fs/lock-file-unless-uncreatable!
               (exclusive-fs/append-lock-path (:ledger-file store)))]
     (try
       (ledger/append-event! (:schema/revisions runtime) (:ledger-file store) event)
