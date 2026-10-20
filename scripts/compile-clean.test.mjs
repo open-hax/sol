@@ -3,16 +3,23 @@
 // to both builds, so a warning or missing artifact cannot leave the job green.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
-const script = new URL('./compile-clean.sh', import.meta.url).pathname;
+// fileURLToPath decodes the URL, so a checkout path with spaces or non-ASCII
+// characters still reaches Bash as a real filesystem path.
+const script = fileURLToPath(new URL('./compile-clean.sh', import.meta.url));
 // compile-clean.sh is a Bash guard run only by the Ubuntu runtime workflow;
 // Windows has no /bin/bash, so its behavioral fixtures are POSIX-only.
 const bashFixture = { skip: process.platform === 'win32' && 'Bash-only compiler guard (Ubuntu workflow)' };
 const runtimeWorkflow = readFileSync(new URL('../.github/workflows/node22-runtime.yml', import.meta.url), 'utf8');
+
+test('compiler guard script path is a decoded filesystem path', () => {
+  assert.ok(existsSync(script), `compile-clean.sh not found at ${script}`);
+});
 
 function run(output, { code = 0, artifact = true, stale = false, channel = 'stdout', target = 'server' } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'sol-compile-clean-'));
