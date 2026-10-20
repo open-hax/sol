@@ -793,7 +793,7 @@
         ;; must not spuriously trip the guard before exclusive creates run.
         (let [created (atom false)]
           (with-redefs [exclusive-fs/create-directory!
-                        (fn [p on-created]
+                        (fn [p on-created _mode]
                           ;; Real create-directory! mkdirs; keep that so the
                           ;; immediate init marker write has a home.
                           (.mkdirSync node-fs (str p))
@@ -986,13 +986,13 @@
         saw (atom nil)]
     (try
       (with-redefs [exclusive-fs/create-directory!
-                    (fn [p on-created]
+                    (fn [p on-created mode]
                       (if (= p schema-directory)
                         (do (reset! saw {:peer-lock (exclusive-fs/try-lock-file!
                                                      (init-lock-path schema-directory))})
                             (exclusive-fs/release-lock! (:peer-lock @saw))
                             (throw (ex-info "crash at claim" {})))
-                        (original-create p on-created)))]
+                        (original-create p on-created mode)))]
         (is (thrown-with-msg? cljs.core/ExceptionInfo #"crash at claim"
               (store/open! (assoc opts :initialize? true)))))
       (is (some? @saw) "schema directory claimed through exclusive create")
@@ -1098,11 +1098,11 @@
         foreign (atom nil)]
     (try
       (with-redefs [exclusive-fs/create-directory!
-                    (fn [p on-created]
+                    (fn [p on-created mode]
                       (when (nil? @foreign)
                         (fs/ensure-dir! schema-directory)
                         (reset! foreign (exclusive-fs/file-identity schema-directory)))
-                      (original-create p on-created))]
+                      (original-create p on-created mode))]
         (is (thrown-with-msg? cljs.core/ExceptionInfo #"fresh storage epoch"
               (store/open! (assoc opts :initialize? true)))))
       (is (= @foreign (exclusive-fs/file-identity schema-directory))
@@ -1483,3 +1483,61 @@
         (is (= identity (exclusive-fs/file-identity schema-directory)) "foreign directory kept")
         (is (not (fs/exists? ledger-file))))
       (finally (fs/remove-tree! root)))))
+
+(deftest initialized-schema-directory-has-ordinary-permissions-test
+  ;; The in-flight claim mode never outlives a successful initialization.
+  (let [root (scratch)
+        {:keys [schema-directory] :as opts} (options root)
+        probe-dir (path/join root "mode-probe")]
+    (try
+      (store/open! (assoc opts :initialize? true))
+      (.mkdirSync node-fs probe-dir)
+      (is (= (bit-and (.-mode (.statSync node-fs probe-dir)) 4095)
+             (bit-and (.-mode (.statSync node-fs schema-directory)) 4095))
+          "schema directory mode matches a plain mkdir")
+      (finally (fs/remove-tree! root)))))
+
+(deftest sticky-directory-without-pre-mkdir-claim-is-kept-test
+  ;; The sticky claim sentinel alone (no pre-mkdir attempt record naming the
+  ;; path) is not Sol ownership evidence: the directory is never removed.
+  (let [root (scratch)
+        {:keys [ledger-file schema-directory] :as opts} (options root)]
+    (try
+      (fs/ensure-dir! (path/dirname schema-directory))
+      (.mkdirSync node-fs schema-directory #js {:mode exclusive-fs/claim-sentinel-mode})
+      (let [identity (exclusive-fs/file-identity schema-directory)]
+        (is (thrown-with-msg? cljs.core/ExceptionInfo #"fresh storage epoch"
+              (store/open! (assoc opts :initialize? true))))
+        (is (= identity (exclusive-fs/file-identity schema-directory)) "foreign sticky directory kept")
+        (is (not (fs/exists? ledger-file))))
+      (finally (fs/remove-tree! root)))))
+
+(deftest process-death-before-schema-mkdir-leaves-retryable-state-test
+  ;; A kill after the pre-mkdir attempt record is durable but before the
+  ;; public mkdir leaves only that record; the next initialize? proceeds.
+  (let [root (scratch)
+        {:keys [ledger-file schema-directory] :as opts} (options root)
+        target (path/resolve schema-directory)
+        original-mkdir (.-mkdirSync node-fs)
+        death (atom nil)]
+    (try
+      (set! (.-mkdirSync node-fs)
+            (fn [& args]
+              (if (and (nil? @death) (= target (path/resolve (str (first args)))))
+                (do (reset! death (snapshot-tree-with-modes root))
+                    (throw (ex-info "process killed before schema mkdir" {})))
+                (.apply original-mkdir node-fs (into-array args)))))
+      (try
+        (is (thrown-with-msg? cljs.core/ExceptionInfo #"process killed before schema mkdir"
+              (store/open! (assoc opts :initialize? true))))
+        (finally (set! (.-mkdirSync node-fs) original-mkdir)))
+      (is (some? @death) "death injected right before the public mkdir")
+      (restore-tree-with-modes! root @death)
+      (is (not (fs/exists? schema-directory)))
+      (is (not (fs/exists? ledger-file)))
+      (let [canonical-store (store/open! (assoc opts :initialize? true))]
+        (is (= [] (store/events canonical-store)) "restart initializes a fresh epoch")
+        (is (not (exclusive-fs/claim-sentinel-mode? schema-directory))))
+      (finally
+        (set! (.-mkdirSync node-fs) original-mkdir)
+        (fs/remove-tree! root)))))

@@ -29,12 +29,17 @@
   "Create one directory exclusively (non-recursive `mkdir`): the parent must
    already exist and an existing path (even an empty directory) fails without
    calling `on-created`. EEXIST is shaped as `{:exclusive-fs/error
-   :already-exists}` so callers never read Node `.code`. `on-created` runs
-   only once this call has created the directory; if it throws the directory
-   is removed so a failed claim never leaves a public empty path. Returns p."
-  [p on-created]
+   :already-exists}` so callers never read Node `.code`. `mode` is the
+   permission bits passed to `mkdir` (nil means the host default; a sticky
+   claim sentinel is used for public schema claims). `on-created` runs only
+   once this call has created the directory; if it throws the directory is
+   removed so a failed claim never leaves a public empty path. Returns p.
+   Always invoked with three arguments so test redefs can forward `mode`."
+  [p on-created mode]
   (try
-    (.mkdirSync node-fs (str p))
+    (if (some? mode)
+      (.mkdirSync node-fs (str p) #js {:mode mode})
+      (.mkdirSync node-fs (str p)))
     (catch :default error
       (if (= "EEXIST" (.-code error))
         (throw (ex-info "Exclusive directory target already exists"
@@ -46,6 +51,29 @@
     (catch :default error
       (try (.rmdirSync node-fs (str p)) (catch :default _ nil))
       (throw error)))
+  p)
+
+(def claim-sentinel-mode
+  "Permission bits for a public exclusive mkdir whose ownership is still
+   being bound: owner r-x plus the sticky bit (01500). A plain mkdir never
+   sets sticky and umask cannot clear it, so a markerless empty directory
+   still carrying it was exposed by a claim that died before binding."
+  0x340)
+
+(defn claim-sentinel-mode?
+  "True when p is an existing directory whose mode still has the sticky
+   claim sentinel bit."
+  [p]
+  (try
+    (let [st (.statSync node-fs (str p))]
+      (boolean (and (.isDirectory st) (pos? (bit-and (.-mode st) 0x200)))))
+    (catch :default _ false)))
+
+(defn clear-claim-sentinel!
+  "Reset p to the host's plain-mkdir permissions (0777 & ~umask), dropping
+   the sticky claim sentinel once ownership evidence is bound."
+  [p]
+  (.chmodSync node-fs (str p) (bit-and 0x1ff (bit-not (.umask js/process))))
   p)
 
 (defn link-new!

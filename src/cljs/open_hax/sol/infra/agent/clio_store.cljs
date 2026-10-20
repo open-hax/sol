@@ -112,6 +112,19 @@
                   :identity (exclusive-fs/file-identity identity-of)})
          "\n"))))
 
+(defn- write-pre-mkdir-claim!
+  "Durable attempt evidence written under the init lock before the public
+   exclusive mkdir. Alone it never authorizes removing a foreign directory;
+   together with the sticky claim mode on an empty markerless directory it
+   proves Sol exposed the path and died before binding the inode."
+  [schema-directory attempt]
+  (exclusive-fs/replace-file!
+   (init-claim-path schema-directory)
+   (str (pr-str {:sol.clio/claim (path/resolve schema-directory)
+                 :sol.clio/attempt (str attempt)
+                 :phase :pre-mkdir})
+        "\n")))
+
 (defn- read-claim-data
   "Parse a claim body when present and well-formed; otherwise nil."
   [claim-path]
@@ -135,6 +148,26 @@
           (= (path/resolve schema-directory) (:sol.clio/claim data))
           current
           (= current (:identity data))))))
+
+(defn- pre-mkdir-claim-names?
+  "True when the durable sibling claim (or its tmp) is this path's pre-mkdir
+   attempt record."
+  [schema-directory]
+  (let [claim (init-claim-path schema-directory)]
+    (boolean
+     (some (fn [data]
+             (and (= :pre-mkdir (:phase data))
+                  (string? (:sol.clio/attempt data))
+                  (= (path/resolve schema-directory) (:sol.clio/claim data))))
+           [(read-claim-data claim) (read-claim-data (str claim ".tmp"))]))))
+
+(defn- inflight-sentinel-claim?
+  "Kill between the public exclusive mkdir and inode binding: the directory
+   still carries the sticky claim sentinel and the pre-mkdir attempt record
+   names it. Neither alone is evidence of Sol ownership."
+  [schema-directory]
+  (and (exclusive-fs/claim-sentinel-mode? schema-directory)
+       (pre-mkdir-claim-names? schema-directory)))
 
 (defn- clear-init-claim!
   [schema-directory]
@@ -314,14 +347,17 @@
 (defn- recover-markerless-empty-claim!
   "A crash between the exclusive mkdir and the first marker rename leaves a
    schema directory holding nothing but (at most) the marker's tmp body, no
-   ledger, and sibling claim evidence bound to that directory's identity.
-   Under the init lock that claim is dead: remove it so initialize can
-   retry. Without matching evidence an empty directory is not Sol's and is
-   never removed."
+   ledger, and Sol ownership evidence: either sibling claim evidence bound
+   to that directory's identity, or the sticky claim mode left by the
+   exclusive mkdir together with the pre-mkdir attempt record naming that
+   path (death before the ownership callback finished). Under the init
+   lock that claim is dead: remove it so initialize can retry. Without
+   matching evidence an empty directory is not Sol's and is never removed."
   [ledger-file schema-directory]
   (promote-claim-tmp! schema-directory)
   (when (and (fs/exists? schema-directory)
-             (claim-proves-ownership? schema-directory)
+             (or (claim-proves-ownership? schema-directory)
+                 (inflight-sentinel-claim? schema-directory))
              (not (fs/exists? (init-marker-path schema-directory)))
              (not (fs/exists? ledger-file))
              (every? #{(path/basename (init-marker-tmp-path schema-directory))}
@@ -444,12 +480,15 @@
 
 (defn- initialize!
   "Create a fresh storage epoch whose artifacts stay private until commit.
-   Caller holds the sibling init lock for the whole attempt. The schema
-   directory is claimed with an exclusive mkdir, so an existing path (even an
-   empty directory created by another actor) fails instead of being taken
-   over. Every marker phase is written crash-atomically (tmp + rename).
-   Publishing is two exclusive hard links: ledger then schema revision. The
-   marker records the ledger inode so recovery can prove ownership."
+   Caller holds the sibling init lock for the whole attempt. A pre-mkdir
+   claim (attempt id) is written first; the schema directory is then claimed
+   with an exclusive mkdir using a sticky claim mode so a kill between mkdir
+   and the ownership callback still leaves recoverable Sol evidence. An
+   existing path (even an empty directory created by another actor) fails
+   instead of being taken over. Every marker phase is written crash-atomically
+   (tmp + rename). Publishing is two exclusive hard links: ledger then schema
+   revision. The marker records the ledger inode so recovery can prove
+   ownership."
   [ledger-file schema-directory]
   (when (or (fs/exists? ledger-file) (fs/exists? schema-directory))
     (fresh-epoch-required!))
@@ -466,20 +505,33 @@
         schema-claimed? (atom false)
         ledger-published? (atom false)]
     (try
-      ;; Exclusive mkdir on the configured path (atomic EEXIST) then bind
-      ;; claim evidence to that inode. create-directory! rolls back the mkdir
-      ;; if the claim write throws; claim.tmp remains recoverable ownership.
+      ;; Pre-mkdir claim (attempt id) then exclusive mkdir with sticky claim
+      ;; mode so a kill between mkdir and the ownership callback leaves both
+      ;; durable sibling evidence and an on-directory sentinel. Identity is
+      ;; bound immediately after; mode is cleared once the inode claim exists.
+      ;; create-directory! still rolls back the mkdir if the callback throws.
+      (write-pre-mkdir-claim! schema-directory attempt)
       (try
-        (exclusive-fs/create-directory! schema-directory
-                                        #(do (reset! schema-claimed? true)
-                                             (write-init-claim! schema-directory)))
+        (exclusive-fs/create-directory!
+         schema-directory
+         #(do (reset! schema-claimed? true)
+              (write-init-claim! schema-directory)
+              ;; Inode claim bound: drop the sticky sentinel (plain mkdir mode).
+              (exclusive-fs/clear-claim-sentinel! schema-directory))
+         exclusive-fs/claim-sentinel-mode)
         (catch :default error
           (if (= :already-exists (:exclusive-fs/error (ex-data error)))
-            (fresh-epoch-required!)
-            (throw error))))
+            ;; Not our directory: the pre-mkdir record names no Sol claim.
+            (do (clear-init-claim! schema-directory)
+                (fresh-epoch-required!))
+            ;; Keep the pre-mkdir record if a failed rollback left the
+            ;; sentinel directory, so the next start can still prove it.
+            (do (when-not (fs/exists? schema-directory)
+                  (clear-init-claim! schema-directory))
+                (throw error)))))
       (write-init-marker! schema-directory (assoc claim :phase :claimed))
       (clear-init-claim! schema-directory)
-      (exclusive-fs/create-directory! staging-schema #(reset! staging-schema? true))
+      (exclusive-fs/create-directory! staging-schema #(reset! staging-schema? true) nil)
       (fs/ensure-dir! (path/dirname ledger-file))
       (exclusive-fs/create-file! staging-ledger #(reset! staging-ledger? true))
       (let [staged (runtime/open staging-schema lifecycle/catalog)
