@@ -135,7 +135,7 @@
         config {:clio/correlation-id-fn
                 (sequential-id-fn
                  ["turn-1" "episode-1"
-                  "event-1" "event-2" "event-3"])
+                  "event-1" "event-2" "event-3" "event-4"])
                 :clio/append!
                 (fn [envelope]
                   (let [append-number (swap! append-count* inc)]
@@ -154,8 +154,13 @@
       (catch :default actual-error
         (is (identical? turn-start-error actual-error))))
     (is (false? @executed?*))
-    (is (= [:sol.run/started :sol.turn/started :sol.run/failed]
+    ;; The compensating emit resolves the pending turn start first (it is
+    ;; admitted on retry), so the admitted turn is closed before the run.
+    (is (= [:sol.run/started :sol.turn/started :sol.turn/failed :sol.run/failed]
            (mapv :event/type @accepted-events*)))
+    (is (= "turn start rejected"
+           (get-in (nth @accepted-events* 2) [:event/data :payload :error]))
+        "the admitted turn start is closed with the original error")
     (is (= (into [nil] (butlast (mapv :event/id @accepted-events*)))
            (mapv #(first (:event/causes %)) @accepted-events*)))
     (is (= "turn start rejected"
