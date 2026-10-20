@@ -60,13 +60,38 @@
    still carrying it was exposed by a claim that died before binding."
   0x340)
 
+(def ^:private sentinel-window-ms
+  "How long after the pre-mkdir record the sentinel mkdir must have happened
+   (initialize! performs the mkdir immediately after writing the record)."
+  2000)
+
 (defn claim-sentinel-mode?
-  "True when p is an existing directory whose mode still has the sticky
-   claim sentinel bit."
+  "True when p is an existing directory still carrying the sticky claim
+   sentinel: sticky bit set and no permission bits beyond the sentinel's."
   [p]
   (try
-    (let [st (.statSync node-fs (str p))]
-      (boolean (and (.isDirectory st) (pos? (bit-and (.-mode st) 0x200)))))
+    (let [st (.statSync node-fs (str p))
+          mode (bit-and (.-mode st) 0xfff)]
+      (boolean (and (.isDirectory st)
+                    (pos? (bit-and mode 0x200))
+                    (zero? (bit-and mode (bit-not claim-sentinel-mode))))))
+    (catch :default _ false)))
+
+(defn sentinel-directory-of-attempt?
+  "True when p carries the claim sentinel, is owned by this process's user,
+   and its inode change time falls within a short window after
+   `written-at-ms` (the pre-mkdir record's timestamp). A directory created
+   later by someone else, with any other mode or owner, does not qualify."
+  [p written-at-ms]
+  (try
+    (let [st (.statSync node-fs (str p))
+          created (.-ctimeMs st)]
+      (boolean
+       (and (number? written-at-ms)
+            (claim-sentinel-mode? p)
+            (or (not (fn? (.-getuid js/process)))
+                (= (.-uid st) (.getuid js/process)))
+            (<= (- written-at-ms 100) created (+ written-at-ms sentinel-window-ms)))))
     (catch :default _ false)))
 
 (defn clear-claim-sentinel!
@@ -208,10 +233,27 @@
       (try (.flockSync fse fd (.-LOCK_UN constants)) (catch :default _ nil))
       (try (.closeSync node-fs fd) (catch :default _ nil)))))
 
-(defn append-lock-path
-  "Permanent sibling lock serializing ledger appends against empty-unlink."
+(defn- canonical-file-path
+  "Canonical spelling of a (possibly not yet created) file: realpath of the
+   file when it exists, else realpath of its parent plus the basename, else
+   the absolute path. Every symlink alias of one ledger maps to one string."
   [p]
-  (str p ".sol-append-lock"))
+  (let [p (str p)]
+    (try
+      (.realpathSync node-fs p)
+      (catch :default _
+        (try
+          (.join node-path (.realpathSync node-fs (.dirname node-path p))
+                 (.basename node-path p))
+          (catch :default _
+            (.resolve node-path p)))))))
+
+(defn append-lock-path
+  "Permanent sibling lock serializing ledger appends against empty-unlink.
+   Derived from the canonical ledger path, so a writer reaching the ledger
+   through a file or directory symlink alias shares the same lock."
+  [p]
+  (str (canonical-file-path p) ".sol-append-lock"))
 
 (defn- fsync-directory!
   "Best-effort durability for a rename inside dir (POSIX); hosts that cannot

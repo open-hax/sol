@@ -122,6 +122,7 @@
    (init-claim-path schema-directory)
    (str (pr-str {:sol.clio/claim (path/resolve schema-directory)
                  :sol.clio/attempt (str attempt)
+                 :sol.clio/written-at-ms (js/Date.now)
                  :phase :pre-mkdir})
         "\n")))
 
@@ -149,25 +150,29 @@
           current
           (= current (:identity data))))))
 
-(defn- pre-mkdir-claim-names?
-  "True when the durable sibling claim (or its tmp) is this path's pre-mkdir
-   attempt record."
+(defn- pre-mkdir-claims
+  "The durable sibling claim (and its tmp) bodies that are this path's
+   pre-mkdir attempt records."
   [schema-directory]
   (let [claim (init-claim-path schema-directory)]
-    (boolean
-     (some (fn [data]
-             (and (= :pre-mkdir (:phase data))
-                  (string? (:sol.clio/attempt data))
-                  (= (path/resolve schema-directory) (:sol.clio/claim data))))
-           [(read-claim-data claim) (read-claim-data (str claim ".tmp"))]))))
+    (filterv (fn [data]
+               (and (= :pre-mkdir (:phase data))
+                    (string? (:sol.clio/attempt data))
+                    (number? (:sol.clio/written-at-ms data))
+                    (= (path/resolve schema-directory) (:sol.clio/claim data))))
+             (keep identity [(read-claim-data claim) (read-claim-data (str claim ".tmp"))]))))
 
 (defn- inflight-sentinel-claim?
-  "Kill between the public exclusive mkdir and inode binding: the directory
-   still carries the sticky claim sentinel and the pre-mkdir attempt record
-   names it. Neither alone is evidence of Sol ownership."
+  "Kill between the public exclusive mkdir and inode binding: a pre-mkdir
+   attempt record names the path, and the directory still carries the exact
+   sticky claim sentinel, is owned by this user and was created within a
+   short window right after that record was written. A record alone, a
+   sticky directory alone, or a directory created later never qualifies."
   [schema-directory]
-  (and (exclusive-fs/claim-sentinel-mode? schema-directory)
-       (pre-mkdir-claim-names? schema-directory)))
+  (boolean
+   (some #(exclusive-fs/sentinel-directory-of-attempt?
+           schema-directory (:sol.clio/written-at-ms %))
+         (pre-mkdir-claims schema-directory))))
 
 (defn- clear-init-claim!
   [schema-directory]
