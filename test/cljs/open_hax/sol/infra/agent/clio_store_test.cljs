@@ -1404,3 +1404,82 @@
         (is (= identity (exclusive-fs/file-identity schema-directory)) "foreign directory kept")
         (is (not (fs/exists? ledger-file))))
       (finally (fs/remove-tree! root)))))
+
+(defn- snapshot-tree-with-modes
+  "Like snapshot-tree, but keeps each entry's permission bits so a restored
+   kill -9 image matches what mkdir(2) actually left on disk."
+  [root]
+  (letfn [(mode-of [p] (bit-and (.-mode (.statSync node-fs p)) 4095))
+          (walk [dir]
+            (into [[:dir dir (mode-of dir)]]
+                  (mapcat (fn [entry]
+                            (let [p (path/join dir (.-name entry))]
+                              (if (.isDirectory entry)
+                                (walk p)
+                                [[:file p (.readFileSync node-fs p) (mode-of p)]])))
+                          (.readdirSync node-fs dir #js {:withFileTypes true}))))]
+    (walk root)))
+
+(defn- restore-tree-with-modes!
+  [root snapshot]
+  (fs/remove-tree! root)
+  (doseq [[kind p bytes-or-mode] snapshot]
+    (case kind
+      :dir (.mkdirSync node-fs p #js {:recursive true})
+      :file (.writeFileSync node-fs p bytes-or-mode)))
+  ;; Apply modes deepest-first so a read-only parent never blocks a child.
+  (doseq [[kind p bytes-or-mode mode] (reverse snapshot)]
+    (.chmodSync node-fs p (if (= :dir kind) bytes-or-mode mode))))
+
+(deftest process-death-right-after-schema-mkdir-stays-recoverable-test
+  ;; Codex s1kbd: a kill between the public schema mkdir and the ownership
+  ;; callback must not leave an empty schema directory that recovery cannot
+  ;; prove is Sol's. Ownership evidence is durable before the directory is
+  ;; exposed, so the next initialize? releases the claim and starts fresh.
+  (let [root (scratch)
+        {:keys [ledger-file schema-directory] :as opts} (options root)
+        target (path/resolve schema-directory)
+        original-mkdir (.-mkdirSync node-fs)
+        death (atom nil)]
+    (try
+      (set! (.-mkdirSync node-fs)
+            (fn [& args]
+              (let [result (.apply original-mkdir node-fs (into-array args))]
+                (when (and (nil? @death) (= target (path/resolve (str (first args)))))
+                  (reset! death (snapshot-tree-with-modes root))
+                  (throw (ex-info "process killed after schema mkdir" {})))
+                result)))
+      (try
+        (is (thrown-with-msg? cljs.core/ExceptionInfo #"process killed after schema mkdir"
+              (store/open! (assoc opts :initialize? true))))
+        (finally (set! (.-mkdirSync node-fs) original-mkdir)))
+      (is (some? @death) "death injected right after the public mkdir")
+      (restore-tree-with-modes! root @death)
+      (is (fs/exists? schema-directory) "the exposed schema directory survives the kill")
+      (is (not (fs/exists? ledger-file)))
+      (let [canonical-store (store/open! (assoc opts :initialize? true))]
+        (is (= [] (store/events canonical-store))
+            "restart proves the claim, releases it and initializes a fresh epoch")
+        (is (not (fs/exists? (init-marker-path schema-directory)))))
+      (finally
+        (set! (.-mkdirSync node-fs) original-mkdir)
+        (fs/remove-tree! root)))))
+
+(deftest pre-mkdir-claim-never-adopts-a-foreign-empty-directory-test
+  ;; Pre-mkdir ownership evidence alone (no directory identity) beside an
+  ;; ordinary empty directory proves nothing: the directory is kept.
+  (let [root (scratch)
+        {:keys [ledger-file schema-directory] :as opts} (options root)]
+    (try
+      (fs/ensure-dir! schema-directory)
+      (fs/write-text! (str (path/resolve schema-directory) ".sol-clio-claim")
+                      (str (pr-str {:sol.clio/claim (path/resolve schema-directory)
+                                    :sol.clio/attempt (str (random-uuid))
+                                    :phase :pre-mkdir})
+                           "\n"))
+      (let [identity (exclusive-fs/file-identity schema-directory)]
+        (is (thrown-with-msg? cljs.core/ExceptionInfo #"fresh storage epoch"
+              (store/open! (assoc opts :initialize? true))))
+        (is (= identity (exclusive-fs/file-identity schema-directory)) "foreign directory kept")
+        (is (not (fs/exists? ledger-file))))
+      (finally (fs/remove-tree! root)))))
