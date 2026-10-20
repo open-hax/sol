@@ -1541,3 +1541,90 @@
       (finally
         (set! (.-mkdirSync node-fs) original-mkdir)
         (fs/remove-tree! root)))))
+
+(deftest marker-paths-survive-a-restart-from-another-working-directory-test
+  ;; Codex ujf5h: initialization with relative paths that dies before the
+  ;; ledger publish must stay recoverable when the restart supplies absolute
+  ;; paths from a different working directory.
+  (let [root (scratch)
+        {:keys [ledger-file schema-directory] :as opts} (options root)
+        epoch (path/dirname ledger-file)
+        original-cwd (.cwd js/process)
+        original-link exclusive-fs/link-new!
+        death (atom nil)]
+    (try
+      (fs/ensure-dir! epoch)
+      (.chdir js/process epoch)
+      (with-redefs [exclusive-fs/link-new!
+                    (fn [from to]
+                      (if (nil? @death)
+                        (do (reset! death (snapshot-tree-with-modes root))
+                            (throw (ex-info "process killed before ledger publish" {})))
+                        (original-link from to)))]
+        (is (thrown-with-msg? cljs.core/ExceptionInfo #"process killed before ledger publish"
+              (store/open! {:ledger-file "events.edn"
+                            :schema-directory "schemas"
+                            :initialize? true}))))
+      (.chdir js/process original-cwd)
+      (is (some? @death))
+      (restore-tree-with-modes! root @death)
+      (is (fs/exists? (init-marker-path schema-directory)) "kill image holds the marker")
+      (let [canonical-store (store/open! (assoc opts :initialize? true))]
+        (is (= [] (store/events canonical-store))
+            "recovery matches the marker and the epoch initializes fresh"))
+      (finally
+        (.chdir js/process original-cwd)
+        (fs/remove-tree! root)))))
+
+(deftest staging-cleanup-failure-keeps-recovery-metadata-test
+  ;; Codex ujf5l: the marker is the only record of the staging paths, so it
+  ;; is cleared only after both staging artifacts are gone; a later open
+  ;; finishes the cleanup instead of leaving an orphan hard link to the
+  ;; live ledger.
+  (let [root (scratch)
+        {:keys [ledger-file schema-directory] :as opts} (options root)
+        original-delete fs/delete-if-exists!
+        failed (atom false)]
+    (try
+      (with-redefs [fs/delete-if-exists!
+                    (fn [p]
+                      (if (and (not @failed)
+                               (str/starts-with? (path/basename (str p))
+                                                 (str (path/basename ledger-file) ".init-")))
+                        (do (reset! failed true)
+                            (throw (ex-info "staging cleanup failed" {})))
+                        (original-delete p)))]
+        (store/open! (assoc opts :initialize? true)))
+      (is @failed "staging-ledger cleanup failure injected")
+      (is (seq (staging-leftovers ledger-file)) "the staging ledger survived the failed cleanup")
+      (is (fs/exists? (init-marker-path schema-directory))
+          "the marker keeps the staging paths for recovery")
+      (let [reopened (store/open! opts)]
+        (is (= [] (store/events reopened)))
+        (is (empty? (staging-leftovers ledger-file)) "recovery removed the staging ledger")
+        (is (empty? (schema-staging-leftovers schema-directory)))
+        (is (not (fs/exists? (init-marker-path schema-directory)))))
+      (finally (fs/remove-tree! root)))))
+
+(deftest append-works-when-the-ledger-parent-is-read-only-test
+  ;; Codex ujf5e: appending to a writable ledger needs no parent write
+  ;; permission. A fresh epoch provisions the append lock at init; a legacy
+  ;; epoch without it still appends when the lock cannot be created (an
+  ;; unwritable parent also forbids the unlink the lock guards against).
+  (let [root (scratch)
+        {:keys [ledger-file] :as opts} (options root)
+        parent (path/dirname ledger-file)
+        posix-user? (and (not= "win32" (.-platform js/process))
+                         (not= 0 (.getuid js/process)))]
+    (try
+      (let [canonical-store (store/open! (assoc opts :initialize? true))]
+        (is (fs/exists? (exclusive-fs/append-lock-path ledger-file))
+            "initialization provisions the permanent append lock")
+        (when posix-user?
+          (fs/delete-if-exists! (exclusive-fs/append-lock-path ledger-file))
+          (.chmodSync node-fs parent 0x16d)
+          (is (= :appended (store/append! canonical-store (candidate canonical-store 1 []))))
+          (is (= 1 (count (store/events canonical-store))))))
+      (finally
+        (.chmodSync node-fs parent 0x1ed)
+        (fs/remove-tree! root)))))
