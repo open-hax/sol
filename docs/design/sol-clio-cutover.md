@@ -48,8 +48,8 @@ exact Node 22.20.0/npm 10.9.3 production install qualification below.
 | --- | --- |
 | `SOL_CLIO_LEDGER_FILE` | Explicit new-epoch ledger file; no default path conversion. |
 | `SOL_CLIO_SCHEMA_DIR` | Explicit catalog-history directory for that epoch. |
-| `SOL_CLIO_INITIALIZE=true` | First initialization only. Both paths must be new; existing paths are refused. |
-| Ordinary reopen | Remove initialization flag. Ledger and schema history must already exist. Complete canonical history is verified before HTTP readiness. |
+| `SOL_CLIO_INITIALIZE=true` | A fresh storage epoch (both paths new) is initialized. A committed Sol epoch at the same paths is reopened. An interrupted Sol initialization is resumed or rolled back under the init lock. Unrelated existing paths are refused. |
+| Ordinary reopen (flag unset) | Ledger and schema history must already exist. An interrupted Sol initialization is first recovered under the init lock. Complete canonical history is verified before HTTP readiness. |
 
 Example for an operator-provisioned fresh epoch, not a deployment instruction:
 
@@ -59,7 +59,10 @@ SOL_CLIO_SCHEMA_DIR=/state/sol/clio-epoch-1/schemas
 SOL_CLIO_INITIALIZE=true
 ```
 
-After successful initialization, remove `SOL_CLIO_INITIALIZE` before restarting.
+After successful initialization, `SOL_CLIO_INITIALIZE` may be removed for
+ordinary reopen; leaving it set reopens the committed epoch instead of refusing
+it. The README and this table describe the same contract, implemented by
+`open!` in `src/cljs/open_hax/sol/infra/agent/clio_store.cljs`.
 Do not point these settings at legacy files. New canonical appends go only to the
 explicit Clio path. Neither old ledger bytes nor old schema snapshots are
 rewritten or imported. Existing session/run projections keep their current paths.

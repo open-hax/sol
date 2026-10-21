@@ -18,11 +18,14 @@ function scratch(action) {
   const directory = mkdtempSync(join(tmpdir(), 'sol-caller-'));
   try { return action(directory); } finally { rmSync(directory, { recursive: true, force: true }); }
 }
-function wrapped(command, output, code = 0, artifact = true, channel = 'stdout') {
+function wrapped(command, output, code = 0, artifact = true, channel = 'stdout', stale = false) {
   return scratch(directory => {
     const bundle = join(directory, 'bundle.js');
-    if (artifact) writeFileSync(bundle, '// fixture');
-    const payload = `process.${channel}.write(${JSON.stringify(output)}); process.exitCode = ${code};`;
+    // The child command writes the artifact, as a real build does; a stale
+    // bundle left by an earlier build must not satisfy the guard.
+    if (stale) writeFileSync(bundle, '// stale fixture');
+    const write = artifact ? `require('node:fs').writeFileSync(${JSON.stringify(bundle)}, '// fixture'); ` : '';
+    const payload = `${write}process.${channel}.write(${JSON.stringify(output)}); process.exitCode = ${code};`;
     const args = command === 'compile_clean' ? ['server', bundle] : ['guard'];
     return spawnSync('/bin/bash', ['--noprofile', '--norc', '-c', `${block('GATE_WRAPPERS')}\n${command} "$@"`, 'fixture',
       ...args, process.execPath, '-e', payload], { env: { ...process.env, RUNNER_TEMP: directory }, encoding: 'utf8' });
@@ -30,15 +33,16 @@ function wrapped(command, output, code = 0, artifact = true, channel = 'stdout')
 }
 const compiled = '[:server] Build completed. (197 files, 9 compiled, 0 warnings, 1.0s)\n';
 test('complete build with nonempty artifact passes', () => assert.equal(wrapped('compile_clean', compiled).status, 0));
-for (const [label, output, code, artifact, channel] of [
+for (const [label, output, code, artifact, channel, stale] of [
   ['compiler warning', compiled.replace('0 warnings', '1 warnings'), 0, true],
   ['stderr warning despite zero completion counter', compiled + 'WARNING: fixture\n', 0, true, 'stderr'],
   ['missing completion', 'Compiler exited quietly\n', 0, true],
   ['wrong completed target', compiled.replace('server', 'clio-native'), 0, true],
   ['missing artifact', compiled, 0, false],
   ['nonzero child exit after completion', compiled, 7, true],
+  ['stale artifact the build did not write', compiled, 0, false, 'stdout', true],
 ]) {
-  test(`reject ${label}`, () => assert.notEqual(wrapped('compile_clean', output, code, artifact, channel).status, 0));
+  test(`reject ${label}`, () => assert.notEqual(wrapped('compile_clean', output, code, artifact, channel, stale).status, 0));
 }
 const tap = '# tests 13\n# pass 13\n# fail 0\n';
 test('completed nonempty Node guards pass', () => assert.equal(wrapped('node_tests', tap).status, 0));

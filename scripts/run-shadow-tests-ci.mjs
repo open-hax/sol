@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process';
+import { realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 const shadowCli = fileURLToPath(new URL('../node_modules/shadow-cljs/cli/runner.js', import.meta.url));
@@ -130,6 +131,20 @@ export function runShadowTests({
   });
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+/**
+ * True when `argv1` names this module. import.meta.url is symlink-resolved,
+ * so compare real paths: a symlinked invocation must still run the suite
+ * rather than define it and exit 0.
+ */
+export function isDirectRun(argv1, moduleUrl) {
+  if (!argv1) return false;
+  try {
+    return realpathSync(argv1) === realpathSync(fileURLToPath(moduleUrl));
+  } catch {
+    return false;
+  }
+}
+
+if (isDirectRun(process.argv[1], import.meta.url)) {
   process.exitCode = (await runShadowTests()).code;
 }

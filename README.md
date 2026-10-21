@@ -111,9 +111,10 @@ replay APIs. See the [bounded cutover contract](docs/design/sol-clio-cutover.md)
 It does not migrate old records or qualify persistent hosted workers.
 
 Canonical filesystem events require explicit `SOL_CLIO_LEDGER_FILE` and
-`SOL_CLIO_SCHEMA_DIR`. Set `SOL_CLIO_INITIALIZE=true` only for first initialization
-of a fresh storage epoch, then remove it before reopening. Initialization refuses
-existing ledger/schema paths. With no configuration, local turn execution still
+`SOL_CLIO_SCHEMA_DIR`. With `SOL_CLIO_INITIALIZE=true`, a fresh storage epoch
+is initialized. A committed Sol epoch at the same paths is reopened. An
+interrupted Sol initialization is resumed or rolled back. Unrelated existing
+paths are refused. With no configuration, local turn execution still
 validates Clio lifecycle data but persists no canonical history. Unsupported
 Mongo/legacy appender configuration is refused; no transport is converted
 implicitly. Existing session/run EDN projections retain their current paths.
