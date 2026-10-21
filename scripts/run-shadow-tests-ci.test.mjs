@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { runShadowTests } from './run-shadow-tests-ci.mjs';
+import { mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { isDirectRun, runShadowTests } from './run-shadow-tests-ci.mjs';
 
 const passing = 'Ran 2 tests containing 3 assertions.\n0 failures, 0 errors.\n';
 const failing = 'Ran 2 tests containing 3 assertions.\n1 failures, 0 errors.\n';
@@ -119,4 +123,20 @@ test('a pipe holder outside the reaped tree fails instead of hanging', {
   if (grandchild) try { process.kill(grandchild, 'SIGKILL'); } catch {}
   assert.equal(result.code, 1);
   assert.equal(result.reason, 'descendant-held-pipes');
+});
+
+test('direct execution through a symlinked path is still recognised', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'sol-runner-'));
+  try {
+    const runner = fileURLToPath(new URL('./run-shadow-tests-ci.mjs', import.meta.url));
+    const alias = join(directory, 'run-shadow-tests-ci.mjs');
+    symlinkSync(runner, alias);
+    // import.meta.url is symlink-resolved; argv[1] keeps the alias spelling.
+    assert.equal(isDirectRun(alias, pathToFileURL(runner).href), true);
+    assert.equal(isDirectRun(runner, pathToFileURL(runner).href), true);
+    assert.equal(isDirectRun(undefined, pathToFileURL(runner).href), false);
+    assert.equal(isDirectRun(join(directory, 'missing.mjs'), pathToFileURL(runner).href), false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
