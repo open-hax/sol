@@ -4,7 +4,21 @@
    callers receive only paths and an ownership callback."
   (:require ["node:fs" :as node-fs]
             ["node:path" :as node-path]
-            ["fs-ext-extra-prebuilt" :as fse]))
+            ["node:module" :as node-module]))
+
+(defonce ^:private fse-module
+  ;; Loaded on the first lock only, matching Clio's lazy native lock binding:
+  ;; requiring this namespace must not dlopen fs-ext-extra-prebuilt.
+  (atom nil))
+
+(defn- ^js fse
+  []
+  (or @fse-module
+      (reset! fse-module
+              ;; Not js/require: shadow :esm output shims it for bundled
+              ;; modules only. Resolve from the app root like Clio does.
+              ((node-module/createRequire (str (.cwd js/process) "/"))
+               "fs-ext-extra-prebuilt"))))
 
 (defn realpath
   "Resolve symlinks to the canonical absolute path. Throws if `p` is missing."
@@ -182,10 +196,10 @@
    opaque lock handle, or nil when another holder has the lock
    (EAGAIN/EWOULDBLOCK). Caller must release-lock!."
   [p]
-  (let [constants (.-constants fse)
+  (let [constants (.-constants (fse))
         fd (.openSync node-fs (str p) "a")]
     (try
-      (.flockSync fse fd (bit-or (.-LOCK_EX constants) (.-LOCK_NB constants)))
+      (.flockSync (fse) fd (bit-or (.-LOCK_EX constants) (.-LOCK_NB constants)))
       {:fd fd :path (str p)}
       (catch :default error
         (.closeSync node-fs fd)
@@ -200,10 +214,10 @@
    a later opener lock a different inode than a current holder. Returns an
    opaque lock handle; caller must release-lock!."
   [p]
-  (let [constants (.-constants fse)
+  (let [constants (.-constants (fse))
         fd (.openSync node-fs (str p) "a")]
     (try
-      (.flockSync fse fd (.-LOCK_EX constants))
+      (.flockSync (fse) fd (.-LOCK_EX constants))
       {:fd fd :path (str p)}
       (catch :default error
         (.closeSync node-fs fd)
@@ -229,8 +243,8 @@
   [lock]
   (when lock
     (let [fd (:fd lock)
-          constants (.-constants fse)]
-      (try (.flockSync fse fd (.-LOCK_UN constants)) (catch :default _ nil))
+          constants (.-constants (fse))]
+      (try (.flockSync (fse) fd (.-LOCK_UN constants)) (catch :default _ nil))
       (try (.closeSync node-fs fd) (catch :default _ nil)))))
 
 (defn- canonical-file-path
