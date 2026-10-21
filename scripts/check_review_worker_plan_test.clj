@@ -62,5 +62,20 @@
     (is (= 1 (:exit result)))
     (is (re-find #"must not activate" (:err result)))))
 
+(deftest missing-integration-gap-is-rejected
+  (let [result (check-fixture (update-in original-plan [:integration/points 0] dissoc :gap))]
+    (is (= 1 (:exit result)))
+    (is (re-find #"Missing integration gap" (:err result)))))
+
+(deftest non-keyword-integration-gap-is-rejected
+  (let [result (check-fixture (assoc-in original-plan [:integration/points 0 :gap] "durable-review-job-delegate"))]
+    (is (= 1 (:exit result)))
+    (is (re-find #"Missing integration gap" (:err result)))))
+
+(deftest wrong-integration-anchor-is-rejected
+  (let [result (check-fixture (assoc-in original-plan [:integration/points 0 :anchor] "ns"))]
+    (is (= 1 (:exit result)))
+    (is (re-find #"Unexpected integration anchor" (:err result)))))
+
 (let [{:keys [fail error]} (run-tests)]
   (System/exit (if (zero? (+ fail error)) 0 1)))

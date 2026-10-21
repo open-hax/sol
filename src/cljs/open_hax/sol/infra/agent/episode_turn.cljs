@@ -53,6 +53,9 @@
                      {:error (error-message turn-start-error)})
             run-failure-error
             (try
+              ;; Compensation resolves the pending turn start first, so a
+              ;; retry may admit it; close that turn before the run.
+              (await (episode-ledger/emit! episode :sol.turn/failed payload))
               (await (episode-ledger/emit!
                       episode
                       :sol.run/failed

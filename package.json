@@ -19,7 +19,7 @@
     "lint": "clj-kondo --lint src/cljs test/cljs && node scripts/contract-guard.mjs src/cljs test/cljs",
     "lint:kondo": "clj-kondo --lint src/cljs test/cljs && node scripts/contract-guard.mjs src/cljs test/cljs",
     "typecheck": "shadow-cljs compile server",
-    "test:guard": "node --test scripts/run-shadow-tests-ci.test.mjs scripts/contract-guard.test.mjs",
+    "test:guard": "node --test scripts/run-shadow-tests-ci.test.mjs scripts/contract-guard.test.mjs scripts/compile-clean.test.mjs",
     "check:startup": "node scripts/check-startup.mjs",
     "build:clio-native": "shadow-cljs compile clio-native",
     "check:clio-native": "node scripts/check-clio-native.mjs"
