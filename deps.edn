@@ -22,7 +22,7 @@
   io.github.open-hax/katamorph    {:git/tag "v0.2.0"
                                     :git/sha "305a5e49d834aca27566f739e8510f6b409fda78"}
   io.github.open-hax/clio         {:git/url "https://github.com/riatzukiza/clio.git"
-                                    :git/sha "d421e929611ddff35a7f819f58bef92680bddef3"}}
+                                    :git/sha "477bf1c3dc920d025c6f1eb3034f2fb56b74d816"}}
 
  :aliases
  ;; Clojure-first mutation harness (mutation/knoxx/…) — mutates CLJS source
