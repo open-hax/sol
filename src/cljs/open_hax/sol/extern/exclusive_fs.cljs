@@ -3,6 +3,7 @@
    path resolution. Raw `node:fs` descriptors stay in this extern namespace;
    callers receive only paths and an ownership callback."
   (:require [clio.extern.js.fs :as clio-fs]
+            [open-hax.sol.extern.module-url :as module-url]
             ["node:fs" :as node-fs]
             ["node:path" :as node-path]
             ["node:module" :as node-module]
@@ -23,20 +24,43 @@
         (when (.isFile (.statSync node-fs real)) real))
       (catch :default _ nil))))
 
-(defn- module-anchors
-  "Files of the loaded Sol code itself (dist/app.js, dist/server.js or a
-   cljs-runtime file), read from this call's own stack: an embedding host's
-   argv and cwd may not reach Sol's nested node_modules. No import.meta, so
-   the same code works in the CommonJS test build."
-  []
-  (->> (re-seq #"(file://[^\s()]+?\.(?:mjs|cjs|js)|/[^\s():]+?\.(?:mjs|cjs|js)):\d+"
-               (str (.-stack (js/Error.))))
-       (map (fn [[_ location]]
-              (file-anchor (if (.startsWith location "file://")
-                             (node-url/fileURLToPath location)
-                             location))))
+(def ^:private stack-frame-pattern
+  ;; Compiled .js/.mjs/.cjs frames, plus .cljs frames that Node reports when
+  ;; the host runs with --enable-source-maps. A .cljs frame maps back to the
+  ;; compiled file beside it only by accident, so file-anchor (which requires
+  ;; an existing file) decides whether the location is usable.
+  #"(file://[^\s()]+?\.(?:mjs|cjs|js|cljs|cljc)|/[^\s():]+?\.(?:mjs|cjs|js|cljs|cljc)):\d+")
+
+(defn- location->path
+  [location]
+  (if (and (string? location) (.startsWith location "file://"))
+    (node-url/fileURLToPath location)
+    location))
+
+(defn stack-anchors
+  "Fallback anchors parsed from a stack string. Accepts source-mapped .cljs
+   frames; keeps only locations that exist as files."
+  [stack]
+  (->> (re-seq stack-frame-pattern (str stack))
+       (map (fn [[_ location]] (file-anchor (location->path location))))
        (remove nil?)
        distinct))
+
+(defn- stable-anchor
+  "Sol's own module file from the module boundary (import.meta.url in ESM,
+   __filename in CommonJS), independent of stack formatting."
+  []
+  (try
+    (file-anchor (location->path (module-url/module-url)))
+    (catch :default _ nil)))
+
+(defn- module-anchors
+  "Files of the loaded Sol code itself: the stable module-owned anchor first,
+   then this call's own stack as a fallback. An embedding host's argv and cwd
+   may not reach Sol's nested node_modules."
+  []
+  (distinct (remove nil? (cons (stable-anchor)
+                               (stack-anchors (.-stack (js/Error.)))))))
 
 (defn sol-module-anchor
   "Real path of the loaded Sol module file, or nil. Clio's own lock loader

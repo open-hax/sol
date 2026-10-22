@@ -10,7 +10,8 @@
    :output-dir "dist",
    :modules
    {:app
-     {:exports
+     {:prepend "globalThis[Symbol.for(\"open-hax.sol/module-url\")] ??= import.meta.url;\n",
+      :exports
       {:solPlugin open-hax.sol.plugin/sol-plugin,
        :config open-hax.sol.infra.config/config-js,
        :bootstrap open-hax.sol.bootstrap/bootstrap!,
@@ -42,7 +43,8 @@
   {:target :esm,
    :runtime :node,
    :output-dir "dist-dev",
-   :modules {:server {:init-fn open-hax.sol.entrypoint/init}},
+   :modules {:server {:init-fn open-hax.sol.entrypoint/init
+                      :prepend "globalThis[Symbol.for(\"open-hax.sol/module-url\")] ??= import.meta.url;\n"}},
    :js-options
    {:js-provider :import,
     :keep-as-import
@@ -74,7 +76,8 @@
   {:target :esm,
    :runtime :node,
    :output-dir "dist",
-   :modules {:server {:init-fn open-hax.sol.entrypoint/init}},
+   :modules {:server {:init-fn open-hax.sol.entrypoint/init
+                      :prepend "globalThis[Symbol.for(\"open-hax.sol/module-url\")] ??= import.meta.url;\n"}},
    :js-options
    {:js-provider :import,
     :keep-as-import
@@ -110,6 +113,9 @@
     :output-to "target/test/test.cjs",
      :ns-regexp "open-hax\\.sol\\..*-test$",
     :autorun true,
+    :build-options
+    {:ns-aliases
+     {open-hax.sol.extern.module-url open-hax.sol.extern.module-url-cjs}},
     :compiler-options
    {:output-feature-set :es-next,
     :macros {:open-hax.sol.macros true},

@@ -1680,3 +1680,25 @@
           (finally
             (try (.chmodSync node-fs schema-directory 0x1ed) (catch :default _ nil))
             (fs/remove-tree! root)))))))
+
+(deftest source-mapped-cljs-stack-frames-are-accepted-test
+  ;; Under node --enable-source-maps, Sol frames are reported as .cljs paths.
+  (let [root (scratch)
+        src (path/resolve root "open_hax" "sol" "extern" "exclusive_fs.cljs")]
+    (fs/ensure-dir! (path/dirname src))
+    (.writeFileSync node-fs src ";; mapped source")
+    (let [stack (str "Error\n"
+                     "    at open_hax$sol$extern$exclusive_fs$module_anchors (" src ":33:12)\n"
+                     "    at file://" src ":45:3\n"
+                     "    at /no/such/host/frame.cljs:1:1\n")]
+      (is (= [(.realpathSync node-fs src)]
+             (exclusive-fs/stack-anchors stack))
+          ".cljs frames resolve to existing files; missing ones are dropped"))))
+
+(deftest stable-module-anchor-survives-enable-source-maps-test
+  ;; Simulate --enable-source-maps: every stack frame is a non-existent .cljs
+  ;; path, so stack parsing yields nothing. The module-owned anchor still does.
+  (with-redefs [exclusive-fs/stack-anchors (fn [_] ())]
+    (let [anchor (exclusive-fs/sol-module-anchor)]
+      (is (string? anchor) "stable anchor from the module boundary")
+      (is (.isFile (.statSync node-fs anchor)) "anchor is a real loaded Sol file"))))
