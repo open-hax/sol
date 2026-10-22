@@ -6,6 +6,9 @@ This is the first local runtime slice, based on Sol
 hosting or a deployment. GitHub publication and board admission remain with the
 parent. Historical receipts and prior build evidence remain unchanged.
 
+The Clio pin is now `9b14cda67d76639ee33aa90eff3caf10dd120d7c` (open-hax/clio#3):
+Clio and Sol load `fs-ext-extra-prebuilt` on the first lock, not at import.
+
 ## Actual authority and runtime
 
 Clio owns generic envelopes, schema identity, validation, admission and complete

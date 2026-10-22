@@ -11,14 +11,41 @@
   ;; requiring this namespace must not dlopen fs-ext-extra-prebuilt.
   (atom nil))
 
+(defn- file-anchor
+  "Real path of an existing file argument (relative ones against cwd), so a
+   launched bundle such as /opt/sol/dist/server.js resolves its own install."
+  [candidate]
+  (when (string? candidate)
+    (try
+      (let [real (.realpathSync node-fs (.resolve node-path candidate))]
+        (when (.isFile (.statSync node-fs real)) real))
+      (catch :default _ nil))))
+
+(defn- resolution-anchors
+  "Entry script(s) on argv first, then cwd: launching Sol from a separate
+   state directory must still find the dependency installed beside it."
+  []
+  (->> (concat (map file-anchor (rest (vec (.-argv js/process))))
+               [(str (.cwd js/process) "/")])
+       (remove nil?)
+       distinct))
+
 (defn- ^js fse
   []
   (or @fse-module
-      (reset! fse-module
-              ;; Not js/require: shadow :esm output shims it for bundled
-              ;; modules only. Resolve from the app root like Clio does.
-              ((node-module/createRequire (str (.cwd js/process) "/"))
-               "fs-ext-extra-prebuilt"))))
+      ;; Not js/require: shadow :esm output shims it for bundled modules only.
+      (let [anchors (resolution-anchors)]
+        (loop [[anchor & more] anchors causes []]
+          (if (nil? anchor)
+            (throw (ex-info "fs-ext-extra-prebuilt is unavailable"
+                            {:module "fs-ext-extra-prebuilt" :anchors (vec anchors)}
+                            (or (first (remove #(= "MODULE_NOT_FOUND" (.-code %)) causes))
+                                (first causes))))
+            (let [r (try {:m ((node-module/createRequire anchor) "fs-ext-extra-prebuilt")}
+                         (catch :default c {:c c}))]
+              (if (contains? r :m)
+                (reset! fse-module (:m r))
+                (recur more (conj causes (:c r))))))))))
 
 (defn realpath
   "Resolve symlinks to the canonical absolute path. Throws if `p` is missing."

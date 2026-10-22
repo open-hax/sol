@@ -1,0 +1,1 @@
+["^ ","~$default-model",["^ ","~:row",5,"~:col",1,"~:fixed-arities",["~#set",[1]],"~:name","^0","~:ns","~$open-hax.sol.infra.defaults","~:top-ns","^7","~:arities",["^ ","~i1",["^ ","~:ret","~:truthy"]],"~:type","~:fn"],"~:filename","src/cljs/open_hax/sol/infra/defaults.cljs"]
