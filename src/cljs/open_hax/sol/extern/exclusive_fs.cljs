@@ -26,7 +26,9 @@
    state directory must still find the dependency installed beside it."
   []
   (->> (concat (map file-anchor (rest (vec (.-argv js/process))))
-               [(str (.cwd js/process) "/")])
+               ;; An explicit file inside cwd: createRequire then searches cwd/node_modules
+               ;; without relying on trailing-separator handling.
+               [(.join node-path (.cwd js/process) "noop.js")])
        (remove nil?)
        distinct))
 
