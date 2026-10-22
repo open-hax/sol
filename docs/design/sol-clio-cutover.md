@@ -1,8 +1,8 @@
 # Bounded Sol lifecycle cutover to Clio
 
 This is the first local runtime slice, based on Sol
-`72fdecca292859d92cba48b686ec6fe9c43a9133`, consuming immutable Clio
-`788cdd3434615a7932b924e68520dbf7f88408c2`. It is not persistent review-worker
+`72fdecca292859d92cba48b686ec6fe9c43a9133`, originally consuming immutable Clio
+`788cdd3434615a7932b924e68520dbf7f88408c2` (predecessor pin; current pin below). It is not persistent review-worker
 hosting or a deployment. GitHub publication and board admission remain with the
 parent. Historical receipts and prior build evidence remain unchanged.
 
@@ -90,7 +90,7 @@ schema revision.
 
 | Capability | Observed gap / proper follow-up |
 | --- | --- |
-| Mongo persistence | Clio 788cdd has no Mongo adapter/storage protocol. Add transport upstream if required, then consume it; no implicit conversion here. |
+| Mongo persistence | Clio (788cdd and current 9b14cda) has no Mongo adapter/storage protocol. Add transport upstream if required, then consume it; no implicit conversion here. |
 | Durable acknowledgement | Upstream locked append calls `appendFileSync` without `fsync`/`fdatasync`. This slice proves native append acceptance, not power-loss durability. The worker contract still requires upstream proof/capability. |
 | Legacy continuity | No predecessor bridge is exposed. Arbitrary old IDs, envelope versions and Mongo global sequence cannot be treated as Clio UUIDs/per-stream history. Preserve old bytes; admit migration upstream separately. |
 | Lease/fence/restart intent | An inode append lock and process-local pending data are not a worker lease, monotonic fence or restart intent store. Existing worker requirements remain unsatisfied. |
