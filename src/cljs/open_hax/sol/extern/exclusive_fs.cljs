@@ -2,7 +2,8 @@
   "Clio storage filesystem boundary: exclusive create/rollback and canonical
    path resolution. Raw `node:fs` descriptors stay in this extern namespace;
    callers receive only paths and an ownership callback."
-  (:require ["node:fs" :as node-fs]
+  (:require [clio.extern.js.fs :as clio-fs]
+            ["node:fs" :as node-fs]
             ["node:path" :as node-path]
             ["node:module" :as node-module]
             ["node:url" :as node-url]))
@@ -43,6 +44,16 @@
    Sol's install rather than the host's argv/cwd."
   []
   (first (module-anchors)))
+
+(defn anchor-clio-native-locks!
+  "Point Clio's lazy lock binding at Sol's install before the first lock.
+   The anchor is set synchronously; the host Promise and any load failure
+   stay here (allSettled) because the lock itself reports the shaped error.
+   Returns nil so callers never see a raw host object."
+  []
+  (when-let [anchor (sol-module-anchor)]
+    (js/Promise.allSettled #js [(clio-fs/load-native-locks! {:resolve-from anchor})]))
+  nil)
 
 (defn- resolution-anchors
   "Sol's own loaded module first, then entry script(s) on argv, then cwd: launching Sol from a separate
