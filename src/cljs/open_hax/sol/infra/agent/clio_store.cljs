@@ -695,6 +695,11 @@
                          [:schema-directory schema-directory]]]
     (when (or (not (string? value)) (str/blank? value))
       (throw (ex-info "Explicit Clio filesystem paths required" {:path/key label}))))
+  ;; Point Clio's lazy lock binding at Sol's install before the first lock.
+  ;; The anchor is set synchronously; a load failure is absorbed here
+  ;; (allSettled) because the lock itself reports the shaped error.
+  (when-let [anchor (exclusive-fs/sol-module-anchor)]
+    (js/Promise.allSettled #js [(fs/load-native-locks! {:resolve-from anchor})]))
   (cond
     initialize?
     (do (require-unnested! ledger-file schema-directory)

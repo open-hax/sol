@@ -4,7 +4,8 @@
    callers receive only paths and an ownership callback."
   (:require ["node:fs" :as node-fs]
             ["node:path" :as node-path]
-            ["node:module" :as node-module]))
+            ["node:module" :as node-module]
+            ["node:url" :as node-url]))
 
 (defonce ^:private fse-module
   ;; Loaded on the first lock only, matching Clio's lazy native lock binding:
@@ -21,11 +22,34 @@
         (when (.isFile (.statSync node-fs real)) real))
       (catch :default _ nil))))
 
+(defn- module-anchors
+  "Files of the loaded Sol code itself (dist/app.js, dist/server.js or a
+   cljs-runtime file), read from this call's own stack: an embedding host's
+   argv and cwd may not reach Sol's nested node_modules. No import.meta, so
+   the same code works in the CommonJS test build."
+  []
+  (->> (re-seq #"(file://[^\s()]+?\.(?:mjs|cjs|js)|/[^\s():]+?\.(?:mjs|cjs|js)):\d+"
+               (str (.-stack (js/Error.))))
+       (map (fn [[_ location]]
+              (file-anchor (if (.startsWith location "file://")
+                             (node-url/fileURLToPath location)
+                             location))))
+       (remove nil?)
+       distinct))
+
+(defn sol-module-anchor
+  "Real path of the loaded Sol module file, or nil. Clio's own lock loader
+   is pointed here so an embedded Sol resolves Clio's native binding from
+   Sol's install rather than the host's argv/cwd."
+  []
+  (first (module-anchors)))
+
 (defn- resolution-anchors
-  "Entry script(s) on argv first, then cwd: launching Sol from a separate
+  "Sol's own loaded module first, then entry script(s) on argv, then cwd: launching Sol from a separate
    state directory must still find the dependency installed beside it."
   []
-  (->> (concat (map file-anchor (rest (vec (.-argv js/process))))
+  (->> (concat (module-anchors)
+               (map file-anchor (rest (vec (.-argv js/process))))
                ;; An explicit file inside cwd: createRequire then searches cwd/node_modules
                ;; without relying on trailing-separator handling.
                [(.join node-path (.cwd js/process) "noop.js")])
