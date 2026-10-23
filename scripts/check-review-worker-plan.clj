@@ -39,7 +39,44 @@
                   [lib (select-keys options [:git/sha :git/tag :deps/root])])))
         (:deps deps)))
 
-(defn check-plan! [proposal-path]
+(defn code-text
+  "Source with `;` line comments, string and regex literals (with escapes) and
+   character literals blanked, so anchors match only code. Line breaks are
+   kept. `#_` discarded forms are still treated as code."
+  [source]
+  (let [sb (StringBuilder.)
+        n (count source)]
+    (loop [i 0 state :code]
+      (if (>= i n)
+        (str sb)
+        (let [c (.charAt ^String source i)]
+          (case state
+            :code (cond
+                    (= c \;) (do (.append sb \space) (recur (inc i) :comment))
+                    (= c \") (do (.append sb \space) (recur (inc i) :string))
+                    (= c \\) (do (.append sb "  ") (recur (+ i 2) :code))
+                    :else (do (.append sb c) (recur (inc i) :code)))
+            :comment (if (= c \newline)
+                       (do (.append sb c) (recur (inc i) :code))
+                       (do (.append sb \space) (recur (inc i) :comment)))
+            :string (cond
+                      (= c \\) (do (.append sb "  ") (recur (+ i 2) :string))
+                      (= c \") (do (.append sb \space) (recur (inc i) :code))
+                      :else (do (.append sb (if (= c \newline) c \space)) (recur (inc i) :string)))))))))
+
+(defn code-token?
+  "True when anchor occurs in code as a whole symbol token, not inside a
+   longer symbol, comment or string."
+  [source anchor]
+  (boolean
+   (re-find (re-pattern (str "(?<![\\w*+!?<>=/.:#'&$%-])"
+                             (java.util.regex.Pattern/quote anchor)
+                             "(?![\\w*+!?<>=/.:#'&$%-])"))
+            (code-text source))))
+
+(defn check-plan!
+  ([proposal-path] (check-plan! proposal-path "."))
+  ([proposal-path source-root]
   (let [plan (edn/read-string (slurp proposal-path))
         deps (edn/read-string (slurp "deps.edn"))
         expected-pins (declared-git-pins deps)
@@ -62,8 +99,8 @@
     (doseq [{:keys [path namespace anchor gap]} points]
       (require-check! (and (keyword? gap) (not (str/blank? (name gap))))
                       (str "Missing integration gap: " path))
-      (require-check! (.isFile (io/file path)) (str "Missing integration file: " path))
-      (let [source (slurp path)
+      (require-check! (.isFile (io/file source-root path)) (str "Missing integration file: " path))
+      (let [source (slurp (io/file source-root path))
             ns-form (binding [*read-eval* false]
                       (read (java.io.PushbackReader. (java.io.StringReader. source))))]
         (require-check! (and (= 'ns (first ns-form))
@@ -73,13 +110,14 @@
                         (str "Blank integration anchor: " path))
         (require-check! (= (get expected-integration-anchors path) anchor)
                         (str "Unexpected integration anchor: " path))
-        (require-check! (str/includes? source anchor) (str "Anchor drift: " path))))
+        (require-check! (code-token? source anchor) (str "Anchor drift: " path))))
     {:proposal (:proposal/id plan) :status :proposed
      :dependency-pins (count (:dependencies plan)) :integration-files (count points)
-     :runtime-validated? false :board-validated? false :deployment-validated? false}))
+     :runtime-validated? false :board-validated? false :deployment-validated? false})))
 
 (try
-  (prn (check-plan! (or (first *command-line-args*) "docs/design/persistent-review-workers.edn")))
+  (prn (check-plan! (or (first *command-line-args*) "docs/design/persistent-review-workers.edn")
+                    (or (second *command-line-args*) ".")))
   (catch Exception error
     (binding [*out* *err*] (println "Proposal check failed:" (.getMessage error)))
     (System/exit 1)))
