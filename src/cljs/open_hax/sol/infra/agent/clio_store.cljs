@@ -695,6 +695,7 @@
                          [:schema-directory schema-directory]]]
     (when (or (not (string? value)) (str/blank? value))
       (throw (ex-info "Explicit Clio filesystem paths required" {:path/key label}))))
+  (exclusive-fs/anchor-clio-native-locks!)
   (cond
     initialize?
     (do (require-unnested! ledger-file schema-directory)

@@ -2,9 +2,111 @@
   "Clio storage filesystem boundary: exclusive create/rollback and canonical
    path resolution. Raw `node:fs` descriptors stay in this extern namespace;
    callers receive only paths and an ownership callback."
-  (:require ["node:fs" :as node-fs]
+  (:require [clio.extern.js.fs :as clio-fs]
+            [open-hax.sol.extern.module-url :as module-url]
+            ["node:fs" :as node-fs]
             ["node:path" :as node-path]
-            ["fs-ext-extra-prebuilt" :as fse]))
+            ["node:module" :as node-module]
+            ["node:url" :as node-url]))
+
+(defonce ^:private fse-module
+  ;; Loaded on the first lock only, matching Clio's lazy native lock binding:
+  ;; requiring this namespace must not dlopen fs-ext-extra-prebuilt.
+  (atom nil))
+
+(defn- file-anchor
+  "Real path of an existing file argument (relative ones against cwd), so a
+   launched bundle such as /opt/sol/dist/server.js resolves its own install."
+  [candidate]
+  (when (string? candidate)
+    (try
+      (let [real (.realpathSync node-fs (.resolve node-path candidate))]
+        (when (.isFile (.statSync node-fs real)) real))
+      (catch :default _ nil))))
+
+(def ^:private stack-frame-pattern
+  ;; Compiled .js/.mjs/.cjs frames, plus .cljs frames that Node reports when
+  ;; the host runs with --enable-source-maps. A .cljs frame maps back to the
+  ;; compiled file beside it only by accident, so file-anchor (which requires
+  ;; an existing file) decides whether the location is usable.
+  #"(file://[^\s()]+?\.(?:mjs|cjs|js|cljs|cljc)|/[^\s():]+?\.(?:mjs|cjs|js|cljs|cljc)):\d+")
+
+(defn- location->path
+  [location]
+  (if (and (string? location) (.startsWith location "file://"))
+    (node-url/fileURLToPath location)
+    location))
+
+(defn stack-anchors
+  "Fallback anchors parsed from a stack string. Accepts source-mapped .cljs
+   frames; keeps only locations that exist as files."
+  [stack]
+  (->> (re-seq stack-frame-pattern (str stack))
+       (map (fn [[_ location]] (file-anchor (location->path location))))
+       (remove nil?)
+       distinct))
+
+(defn- stable-anchor
+  "Sol's own module file from the module boundary (import.meta.url in ESM,
+   __filename in CommonJS), independent of stack formatting."
+  []
+  (try
+    (file-anchor (location->path (module-url/module-url)))
+    (catch :default _ nil)))
+
+(defn- module-anchors
+  "Files of the loaded Sol code itself: the stable module-owned anchor first,
+   then this call's own stack as a fallback. An embedding host's argv and cwd
+   may not reach Sol's nested node_modules."
+  []
+  (distinct (remove nil? (cons (stable-anchor)
+                               (stack-anchors (.-stack (js/Error.)))))))
+
+(defn sol-module-anchor
+  "Real path of the loaded Sol module file, or nil. Clio's own lock loader
+   is pointed here so an embedded Sol resolves Clio's native binding from
+   Sol's install rather than the host's argv/cwd."
+  []
+  (first (module-anchors)))
+
+(defn anchor-clio-native-locks!
+  "Point Clio's lazy lock binding at Sol's install before the first lock.
+   The anchor is set synchronously; the host Promise and any load failure
+   stay here (allSettled) because the lock itself reports the shaped error.
+   Returns nil so callers never see a raw host object."
+  []
+  (when-let [anchor (sol-module-anchor)]
+    (js/Promise.allSettled #js [(clio-fs/load-native-locks! {:resolve-from anchor})]))
+  nil)
+
+(defn- resolution-anchors
+  "Sol's own loaded module first, then entry script(s) on argv, then cwd: launching Sol from a separate
+   state directory must still find the dependency installed beside it."
+  []
+  (->> (concat (module-anchors)
+               (map file-anchor (rest (vec (.-argv js/process))))
+               ;; An explicit file inside cwd: createRequire then searches cwd/node_modules
+               ;; without relying on trailing-separator handling.
+               [(.join node-path (.cwd js/process) "noop.js")])
+       (remove nil?)
+       distinct))
+
+(defn- ^js fse
+  []
+  (or @fse-module
+      ;; Not js/require: shadow :esm output shims it for bundled modules only.
+      (let [anchors (resolution-anchors)]
+        (loop [[anchor & more] anchors causes []]
+          (if (nil? anchor)
+            (throw (ex-info "fs-ext-extra-prebuilt is unavailable"
+                            {:module "fs-ext-extra-prebuilt" :anchors (vec anchors)}
+                            (or (first (remove #(= "MODULE_NOT_FOUND" (.-code %)) causes))
+                                (first causes))))
+            (let [r (try {:m ((node-module/createRequire anchor) "fs-ext-extra-prebuilt")}
+                         (catch :default c {:c c}))]
+              (if (contains? r :m)
+                (reset! fse-module (:m r))
+                (recur more (conj causes (:c r))))))))))
 
 (defn realpath
   "Resolve symlinks to the canonical absolute path. Throws if `p` is missing."
@@ -182,10 +284,10 @@
    opaque lock handle, or nil when another holder has the lock
    (EAGAIN/EWOULDBLOCK). Caller must release-lock!."
   [p]
-  (let [constants (.-constants fse)
+  (let [constants (.-constants (fse))
         fd (.openSync node-fs (str p) "a")]
     (try
-      (.flockSync fse fd (bit-or (.-LOCK_EX constants) (.-LOCK_NB constants)))
+      (.flockSync (fse) fd (bit-or (.-LOCK_EX constants) (.-LOCK_NB constants)))
       {:fd fd :path (str p)}
       (catch :default error
         (.closeSync node-fs fd)
@@ -200,10 +302,10 @@
    a later opener lock a different inode than a current holder. Returns an
    opaque lock handle; caller must release-lock!."
   [p]
-  (let [constants (.-constants fse)
+  (let [constants (.-constants (fse))
         fd (.openSync node-fs (str p) "a")]
     (try
-      (.flockSync fse fd (.-LOCK_EX constants))
+      (.flockSync (fse) fd (.-LOCK_EX constants))
       {:fd fd :path (str p)}
       (catch :default error
         (.closeSync node-fs fd)
@@ -229,8 +331,8 @@
   [lock]
   (when lock
     (let [fd (:fd lock)
-          constants (.-constants fse)]
-      (try (.flockSync fse fd (.-LOCK_UN constants)) (catch :default _ nil))
+          constants (.-constants (fse))]
+      (try (.flockSync (fse) fd (.-LOCK_UN constants)) (catch :default _ nil))
       (try (.closeSync node-fs fd) (catch :default _ nil)))))
 
 (defn- canonical-file-path

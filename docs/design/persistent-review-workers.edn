@@ -20,7 +20,7 @@
                   :deps/root "packages/eta-mu"}
   io.github.open-hax/katamorph {:git/tag "v0.2.0"
                                :git/sha "305a5e49d834aca27566f739e8510f6b409fda78"}
-  io.github.open-hax/clio {:git/sha "788cdd3434615a7932b924e68520dbf7f88408c2"}}
+  io.github.open-hax/clio {:git/sha "9b14cda67d76639ee33aa90eff3caf10dd120d7c"}}
  :dispatch
  {:supplier :eta-mu
   :required-fields [:repository/id :pull-request/id :base/sha :head/sha

@@ -105,7 +105,7 @@ The unchanged Git dependencies are public. CI resolves their pinned HTTPS
 revisions with credential helpers and prompts disabled; no dependency secret
 is required. A local Git cache does not qualify fresh hosted dependency access.
 The merged Node22 prerequisite qualified the predecessor dependency at that
-revision. This local follow-up consumes immutable Clio `788cdd3434615a7932b924e68520dbf7f88408c2`
+revision. This local follow-up consumes immutable Clio `9b14cda67d76639ee33aa90eff3caf10dd120d7c`
 through its actual schema, event construction, filesystem admission and complete
 replay APIs. See the [bounded cutover contract](docs/design/sol-clio-cutover.md).
 It does not migrate old records or qualify persistent hosted workers.

@@ -10,7 +10,8 @@
    :output-dir "dist",
    :modules
    {:app
-     {:exports
+     {:prepend "globalThis[Symbol.for(\"open-hax.sol/module-url\")] ??= import.meta.url;\n",
+      :exports
       {:solPlugin open-hax.sol.plugin/sol-plugin,
        :config open-hax.sol.infra.config/config-js,
        :bootstrap open-hax.sol.bootstrap/bootstrap!,
@@ -23,7 +24,7 @@
      #{"node:fs/promises"
        "node:fs"
        "node:crypto"
-       "fs-ext-extra-prebuilt"
+       "node:module"
        "node:path"
         "node:url"
         "@modelcontextprotocol/sdk/client/index.js"
@@ -42,14 +43,15 @@
   {:target :esm,
    :runtime :node,
    :output-dir "dist-dev",
-   :modules {:server {:init-fn open-hax.sol.entrypoint/init}},
+   :modules {:server {:init-fn open-hax.sol.entrypoint/init
+                      :prepend "globalThis[Symbol.for(\"open-hax.sol/module-url\")] ??= import.meta.url;\n"}},
    :js-options
    {:js-provider :import,
     :keep-as-import
      #{"node:fs/promises"
        "node:fs"
        "node:crypto"
-       "fs-ext-extra-prebuilt"
+       "node:module"
        "node:path"
         "node:url"
         "@modelcontextprotocol/sdk/client/index.js"
@@ -74,14 +76,15 @@
   {:target :esm,
    :runtime :node,
    :output-dir "dist",
-   :modules {:server {:init-fn open-hax.sol.entrypoint/init}},
+   :modules {:server {:init-fn open-hax.sol.entrypoint/init
+                      :prepend "globalThis[Symbol.for(\"open-hax.sol/module-url\")] ??= import.meta.url;\n"}},
    :js-options
    {:js-provider :import,
     :keep-as-import
      #{"node:fs/promises"
        "node:fs"
        "node:crypto"
-       "fs-ext-extra-prebuilt"
+       "node:module"
        "node:path"
         "node:url"
         "@modelcontextprotocol/sdk/client/index.js"
@@ -102,7 +105,7 @@
    :modules {:probe {:exports {:probe open-hax.sol.clio-native-probe/probe-edn!}}}
    :js-options {:js-provider :import
                 :keep-as-import #{"node:fs" "node:crypto" "node:path"
-                                  "node:process" "fs-ext-extra-prebuilt"}}
+                                  "node:process" "node:module"}}
    :compiler-options {:output-feature-set :es-next :optimizations :none
                       :infer-externs false}}
   :test
@@ -110,6 +113,9 @@
     :output-to "target/test/test.cjs",
      :ns-regexp "open-hax\\.sol\\..*-test$",
     :autorun true,
+    :build-options
+    {:ns-aliases
+     {open-hax.sol.extern.module-url open-hax.sol.extern.module-url-cjs}},
     :compiler-options
    {:output-feature-set :es-next,
     :macros {:open-hax.sol.macros true},
