@@ -1,6 +1,8 @@
 (ns open-hax.sol.shape.episode-event-test
   (:require [cljs.test :refer [deftest is testing]]
-            [open-hax.event-ledger :as event-ledger]
+            [clio.domain.schema :as schema]
+            [clio.infra.event :as event]
+            [open-hax.sol.infra.agent.clio-store :as store]
             [open-hax.sol.shape.episode-event :as episode-event]))
 
 (def agent-spec
@@ -96,36 +98,29 @@
                    {})]
       (is (= kind (:principal/kind binding))))))
 
-(deftest episode-envelope-correspondence-test
-  (let [context (episode-event/episode-context
-                 {:run-id "run-1"
-                  :session-id "session-1"
-                  :turn-id "turn-1"
-                  :episode-id "episode-1"
-                  :conversation-id "conversation-1"
-                  :causal-root "event-1"
-                  :node-id "sol.node.local"
+(deftest episode-clio-correspondence-test
+  (let [root "00000000-0000-4000-8000-000000000001"
+        context (episode-event/episode-context
+                 {:run-id "run-1" :session-id "session-1" :turn-id "turn-1"
+                  :episode-id "episode-1" :conversation-id "conversation-1"
+                  :causal-root root :node-id "sol.node.local"
                   :auth-context {:principal/binding runtime-binding}
                   :agent-spec agent-spec})
-        envelope (episode-event/envelope
-                  context
-                  "event-2"
-                  "2026-07-27T00:00:00.000Z"
-                  "event-1"
-                  "sol.turn.started"
-                  {:status "running"})]
-    (is (= "run-1" (:run/id envelope)))
-    (is (= "session-1" (:session/id envelope)))
-    (is (= "turn-1" (:turn/id envelope)))
-    (is (= "episode-1" (:episode/id envelope)))
-    (is (= "event-1" (:causal/root envelope)))
-    (is (= "event-1" (:causal/parent envelope)))
-    (is (= "conversation-1"
-           (get-in envelope [:payload :conversation/id])))
-    (is (= ["agent/research"] (:contracts envelope)))
-    (is (= [{:resource/id "agent/research"
-             :resource/revision "git:abc123"}]
-           (:contract/refs envelope)))
-    (is (= expected-ledger-binding
-           (get-in envelope [:event/from :principal/binding])))
-    (is (true? (:valid (event-ledger/validate-envelope envelope))))))
+        revision (store/current-revision nil)
+        facts (episode-event/event-facts context 2 root {:status "running"})
+        constructed (event/make-event revision :sol.turn/started facts)
+        data (:event/data constructed)]
+    (is (= "run-1" (:run/id data)))
+    (is (= "session-1" (:session/id data)))
+    (is (= "turn-1" (:turn/id data)))
+    (is (= "episode-1" (:episode/id data)))
+    (is (= root (:causal/root data)))
+    (is (= [root] (:event/causes constructed)))
+    (is (= 2 (:event/seq constructed)))
+    (is (= "episode-1" (:event/stream constructed)))
+    (is (= "conversation-1" (get-in data [:payload :conversation/id])))
+    (is (= ["agent/research"] (:contracts data)))
+    (is (= [{:resource/id "agent/research" :resource/revision "git:abc123"}]
+           (:contract/refs data)))
+    (is (= expected-ledger-binding (get-in data [:event/from :principal/binding])))
+    (is (= constructed (schema/validate-event! [revision] constructed)))))

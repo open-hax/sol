@@ -1,0 +1,128 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: eta-mu evidence review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  evidence-review:
+    name: Evidence-first review (eta-mu)
+    # Parent-selected merged Eta/Muse pair; caller remains local/unpublished.
+    # New-head native caller CI/review qualification remains parent-owned.
+    uses: open-hax/eta-mu/.github/workflows/opencode-code-review.yml@694a2602709d130b2a60045a25537f1b4476ec1f
+    # Explicitly forward across the personal-repository / open-hax boundary.
+    secrets:
+      ETA_MU_APP_ID: ${{ secrets.ETA_MU_APP_ID }}
+      ETA_MU_APP_PRIVATE_KEY: ${{ secrets.ETA_MU_APP_PRIVATE_KEY }}
+      DISCORD_REVIEW_WEBHOOK_URL: ${{ secrets.DISCORD_REVIEW_WEBHOOK_URL }}
+    with:
+      pr_head_sha: ${{ github.event.pull_request.head.sha }}
+      model: opencode/mimo-v2.6-flash-free
+      node_version: "22.20.0"
+      muse_revision: 0b9a91492c8355e6933dc2164d35668cb76d9e60
+      agents_revision: 7fd3252e7663ad5e68be5e90429d126aa66c38c8
+      setup_eta_mu_toolchain: true
+      evidence_gates_script: |
+        # run_gate records the command's real status but returns zero itself.
+        gate_ok() { [[ "$(awk -F= -v gate="$1" '$1 == gate {print $2}' "$statuses")" == 0 ]]; }
+        skip_gates() {
+          for gate in "$@"; do printf '%s=125\n' "$gate" >> "$statuses"; done
+          printf 'Prerequisite failed; skipped: %s\n' "$*" >> "$log"
+        }
+        # BEGIN GATE_WRAPPERS
+        compile_clean() (
+          set -e -o pipefail
+          target="$1"; artifact="$2"; shift 2
+          rm -f -- "$artifact"
+          output="$RUNNER_TEMP/sol-$target-build.log"
+          "$@" 2>&1 | tee "$output"
+          grep -Eq "^\[:${target}\] Build completed\. \([1-9][0-9]* files, [0-9]+ compiled, 0 warnings," "$output"
+          if grep -Eq '(^|[^[:alnum:]_])WARNING([[:space:]:]|$)|[1-9][0-9]* warnings' "$output"; then
+            printf 'Compiler warnings in %s\n' "$target" >&2
+            exit 1
+          fi
+          test -s "$artifact"
+        )
+        node_tests() (
+          set -e -o pipefail
+          label="$1"; shift
+          output="$RUNNER_TEMP/sol-$label-tests.log"
+          "$@" 2>&1 | tee "$output"
+          tests=$(awk '/^# tests / {print $3}' "$output")
+          passed=$(awk '/^# pass / {print $3}' "$output")
+          failed=$(awk '/^# fail / {print $3}' "$output")
+          [[ "$tests" =~ ^[1-9][0-9]*$ && "$passed" == "$tests" && "$failed" == 0 ]]
+        )
+        # END GATE_WRAPPERS
+        export GITLIBS="$RUNNER_TEMP/sol-public-gitlibs"
+        export SOL_EVIDENCE_PRODUCTION="$RUNNER_TEMP/sol-evidence-production"
+
+        run_gate generated_excludes bash --noprofile --norc -e -o pipefail -c '
+          # BEGIN GENERATED_EXCLUDES
+          exclude=$(git rev-parse --git-path info/exclude)
+          printf "%s\n" /.cpcache/ /.clj-kondo/.cache/ /.clj-kondo/imports/ >> "$exclude"
+          # END GENERATED_EXCLUDES
+        '
+        run_gate tools bash --noprofile --norc -e -o pipefail -c '
+          for tool in node npm java clojure bb clj-kondo git; do command -v "$tool"; done
+          test "$(node --version)" = v22.20.0
+          test "$(npm --version)" = 10.9.3
+          node --version
+          npm --version
+          java -version
+          clojure -Sdescribe
+          bb --version
+          clj-kondo --version
+        '
+        if gate_ok generated_excludes && gate_ok tools; then
+          run_gate install npm ci --no-audit --no-fund
+          run_gate public_deps env -u GIT_ASKPASS -u SSH_ASKPASS GIT_TERMINAL_PROMPT=0 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0= GIT_CONFIG_KEY_1=core.askPass GIT_CONFIG_VALUE_1= clojure -Srepro -P
+          run_gate frozen_inputs git diff --exit-code -- package.json package-lock.json deps.edn
+          if gate_ok install && gate_ok public_deps && gate_ok frozen_inputs; then
+            run_gate caller_fixture node_tests caller-fixture node --test .github/fixtures/sol-evidence-caller.test.mjs
+            run_gate guard_regressions node_tests guards npm run test:guard
+            run_gate lint npm run lint
+            run_gate planning bb scripts/check-review-worker-plan.clj
+            run_gate planning_regressions bb scripts/check_review_worker_plan_test.clj
+            # Sol's existing npm test guard enforces completed, nonempty tests and zero warnings.
+            run_gate test npm test
+            run_gate build compile_clean server dist/server.js npm run build
+            run_gate clio_native_build compile_clean clio-native target/clio-native/probe.js npm run build:clio-native
+            if gate_ok caller_fixture && gate_ok guard_regressions && gate_ok lint && gate_ok planning && gate_ok planning_regressions && gate_ok test && gate_ok build && gate_ok clio_native_build; then
+              run_gate production_install bash --noprofile --norc -e -o pipefail -c '
+                # Fresh production closure; never reuse a warm stage or development dependencies.
+                mkdir "$SOL_EVIDENCE_PRODUCTION"
+                cp package.json package-lock.json "$SOL_EVIDENCE_PRODUCTION/"
+                cp -R dist "$SOL_EVIDENCE_PRODUCTION/dist"
+                cp -R target/clio-native "$SOL_EVIDENCE_PRODUCTION/clio-native"
+                npm ci --omit=dev --no-audit --no-fund --prefix "$SOL_EVIDENCE_PRODUCTION"
+                cmp package.json "$SOL_EVIDENCE_PRODUCTION/package.json"
+                cmp package-lock.json "$SOL_EVIDENCE_PRODUCTION/package-lock.json"
+                test ! -d "$SOL_EVIDENCE_PRODUCTION/node_modules/shadow-cljs"
+                test ! -d "$SOL_EVIDENCE_PRODUCTION/node_modules/typebox"
+                test -s "$SOL_EVIDENCE_PRODUCTION/dist/server.js"
+                test -s "$SOL_EVIDENCE_PRODUCTION/clio-native/probe.js"
+              '
+              if gate_ok production_install; then
+                run_gate production_native node scripts/check-clio-native.mjs "$SOL_EVIDENCE_PRODUCTION/clio-native/probe.js"
+                run_gate startup_default node scripts/check-startup.mjs "$SOL_EVIDENCE_PRODUCTION/dist/server.js"
+                run_gate startup_clio node scripts/check-startup.mjs "$SOL_EVIDENCE_PRODUCTION/dist/server.js" --clio
+              else
+                skip_gates production_native startup_default startup_clio
+              fi
+            else
+              skip_gates production_install production_native startup_default startup_clio
+            fi
+          else
+            skip_gates caller_fixture guard_regressions lint planning planning_regressions test build clio_native_build production_install production_native startup_default startup_clio
+          fi
+        else
+          skip_gates install public_deps frozen_inputs caller_fixture guard_regressions lint planning planning_regressions test build clio_native_build production_install production_native startup_default startup_clio
+        fi
+        run_gate frozen_completion git diff --exit-code -- package.json package-lock.json deps.edn
+        # The reusable workflow binds exact head and clean completion over every tracked/untracked path.

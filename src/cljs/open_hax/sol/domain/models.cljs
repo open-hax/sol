@@ -14,13 +14,16 @@
 (def ^:private eta-mu-registry-input-kinds
   #{"text" "image" "audio"})
 
-(defn- parse-prefix-allowlist
+(defn parse-prefix-allowlist
+  "Normalize a prefix allowlist from a comma-separated string or an already
+   sequential value. Sequential input is mapped/trimmed, never stringified."
   [raw]
-  (-> (str (or raw ""))
-      (str/split #",")
-      (->> (map (fn [v] (some-> v str str/trim not-empty)))
-           (remove nil?)
-           vec)))
+  (->> (if (sequential? raw)
+         raw
+         (str/split (str (or raw "")) #","))
+       (map (fn [v] (some-> v str str/trim not-empty)))
+       (remove nil?)
+       vec))
 
 (defn normalize-thinking-level
   [value]

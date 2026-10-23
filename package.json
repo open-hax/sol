@@ -15,21 +15,33 @@
     "watch": "shadow-cljs watch server-dev",
     "start": "node dist/server.js",
     "start:dev": "node dist-dev/server.js",
-    "test": "shadow-cljs compile test",
+    "test": "node scripts/run-shadow-tests-ci.mjs",
     "lint": "clj-kondo --lint src/cljs test/cljs && node scripts/contract-guard.mjs src/cljs test/cljs",
     "lint:kondo": "clj-kondo --lint src/cljs test/cljs && node scripts/contract-guard.mjs src/cljs test/cljs",
-    "typecheck": "shadow-cljs compile server"
+    "typecheck": "shadow-cljs compile server",
+    "test:guard": "node --test scripts/run-shadow-tests-ci.test.mjs scripts/contract-guard.test.mjs scripts/compile-clean.test.mjs",
+    "check:startup": "node scripts/check-startup.mjs",
+    "build:clio-native": "shadow-cljs compile clio-native",
+    "check:clio-native": "node scripts/check-clio-native.mjs"
   },
   "dependencies": {
     "@fastify/cors": "^10.0.1",
     "@fastify/formbody": "^8.0.2",
     "@fastify/websocket": "^11.2.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "fastify": "^5.6.1"
+    "fastify": "^5.6.1",
+    "fs-ext-extra-prebuilt": "2.2.9"
   },
   "devDependencies": {
-    "shadow-cljs": "^3.4.10",
+    "shadow-cljs": "3.4.11",
     "typebox": "^1.1.34",
     "ws": "^8.20.0"
+  },
+  "engines": {
+    "node": "22.x"
+  },
+  "volta": {
+    "node": "22.20.0",
+    "npm": "10.9.3"
   }
 }

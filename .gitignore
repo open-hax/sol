@@ -7,3 +7,5 @@
 .nrepl-port
 *.log
 .ημ
+.clj-kondo/.cache/
+.cpcache/

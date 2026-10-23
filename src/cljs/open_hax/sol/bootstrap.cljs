@@ -5,9 +5,11 @@
    - shadow-cljs calls open-hax.sol.entrypoint/init.
    - Node/npm modules are required by the CLJS namespaces that consume them.
    - This namespace orchestrates startup and manages the HTTP lifecycle."
-  (:require [open-hax.sol.contract-runtime-deps :as contract-runtime-deps]
+  (:require [open-hax.sol.extern.console :as xconsole]
+            [open-hax.sol.contract-runtime-deps :as contract-runtime-deps]
             [open-hax.sol.infra.agent.run-state :as run-state]
             [open-hax.sol.infra.agent.session-store :as session-store]
+            [open-hax.sol.infra.agent.clio-store :as clio-store]
             [open-hax.sol.infra.core :as core]
             [open-hax.sol.infra.graceful-shutdown :as graceful-shutdown]
             [open-hax.sol.infra.http-server :as http-server]
@@ -88,10 +90,12 @@
 (defn ^:async bootstrap!
   "Main entrypoint called by shadow-cljs."
   []
-  (let [cfg (contract-runtime-deps/inject-deps!
-             (runtime-models/enrich-config (runtime-config/cfg) process/env-var))
+  (let [cfg (clio-store/configure!
+             (contract-runtime-deps/inject-deps!
+              (runtime-models/enrich-config (runtime-config/cfg) process/env-var)))
         base-dir (path/join (path/cwd) ".ημ" "sol")
-        session-store (session-store/create-edn-session-store (path/join base-dir "sessions"))
+        session-store (session-store/create-edn-session-store
+                       (path/join base-dir "sessions") (:clio/store cfg))
         run-state-store (run-state/create-edn-run-state-store (path/join base-dir "runs"))]
     (session-store/set-default-store! session-store)
     (run-state/set-default-store! run-state-store)
@@ -122,20 +126,31 @@
   (.log js/console "[sol-hot-reload] after-load: starting HTTP server"
         #js {:pid (.-pid js/process)
              :uptimeMs (process-uptime-ms)})
-  (let [{:keys [runtime]} (lifecycle/context)
-        config (contract-runtime-deps/inject-deps!
-                (runtime-models/enrich-config (runtime-config/cfg) process/env-var))]
+  (let [{:keys [runtime] previous-config :config} (lifecycle/context)]
     (if runtime
-      (do
-        (lifecycle/remember-context! runtime config nil false)
-        (try
+      (try
+        (let [config (clio-store/reconfigure!
+                      previous-config
+                      (contract-runtime-deps/inject-deps!
+                       (runtime-models/enrich-config (runtime-config/cfg) process/env-var)))]
+          (lifecycle/remember-context! runtime config nil false)
           (await (start-http! runtime config))
           (.log js/console "[sol-hot-reload] after-load: HTTP server started"
                 #js {:pid (.-pid js/process)
-                     :uptimeMs (process-uptime-ms)})
-          (catch :default err
-            (.error js/console "[sol-hot-reload] failed to restart HTTP server" err))
-          (finally (done))))
+                     :uptimeMs (process-uptime-ms)}))
+        (catch :default err
+          (.error js/console "[sol-hot-reload] failed to restart HTTP server" err)
+          ;; Reconfiguration (or the restart) failed after before-load closed the
+          ;; server; restore service with the previous, still-remembered config.
+          (try
+            (await (start-http! runtime previous-config))
+            ;; Keep the lifecycle context in step with the server actually running,
+            ;; so the next reload's previous-config is the working one.
+            (lifecycle/remember-context! runtime previous-config nil false)
+            (xconsole/warn! "[sol-hot-reload] after-load: restored HTTP server with previous config")
+            (catch :default restore-err
+              (xconsole/error! "[sol-hot-reload] failed to restore HTTP server with previous config" restore-err))))
+        (finally (done)))
       (do
         (.warn js/console "[sol-hot-reload] no lifecycle context; skipping HTTP restart")
         (done)))))

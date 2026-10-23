@@ -46,6 +46,9 @@
    ;; port is 8001 — Sol's own port, not knoxx's 8000.
     :host (env "SOL_HOST" (env "HOST" "0.0.0.0"))
     :port (js/parseInt (env "SOL_PORT" (env "PORT" "8001")) 10)
+    :clio/ledger-file (env-first ["SOL_CLIO_LEDGER_FILE"] nil)
+    :clio/schema-directory (env-first ["SOL_CLIO_SCHEMA_DIR"] nil)
+    :clio/initialize? (= "true" (env "SOL_CLIO_INITIALIZE" "false"))
     :public-base-url (env "SOL_PUBLIC_BASE_URL" "")
     :knoxx-base-url (env "KNOXX_BASE_URL" "http://localhost:8000")
    :knoxx-api-key (env "KNOXX_API_KEY" "")

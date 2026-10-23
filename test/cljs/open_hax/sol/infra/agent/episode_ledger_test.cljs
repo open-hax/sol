@@ -1,114 +1,97 @@
 (ns open-hax.sol.infra.agent.episode-ledger-test
   (:require [cljs.test :refer [deftest is]]
-            [open-hax.event-ledger :as event-ledger]
+            [clio.domain.schema :as schema]
             [open-hax.sol.infra.agent.episode-ledger :as episode-ledger]))
 
-(defn- sequential-id-fn
-  [ids]
-  (let [remaining* (atom (vec ids))]
-    (fn []
-      (let [id (first @remaining*)]
-        (swap! remaining* subvec 1)
-        id))))
-
 (def episode-input
-  {:run-id "run-1"
-   :session-id "session-1"
-   :conversation-id "conversation-1"
-   :agent-spec {:actor-id "actor.agent.research"
-                :contract-id "agent/research"
+  {:run-id "run-1" :session-id "session-1" :conversation-id "conversation-1"
+   :agent-spec {:actor-id "actor.agent.research" :contract-id "agent/research"
                 :contract-revision "git:abc123"}
-   :auth-context {:actorId "actor.agent.research"
-                  :entityId "entity.agent.research"
-                  :orgId "org.open-hax"
-                  :principalKind "agent"}})
+   :auth-context {:actorId "actor.agent.research" :entityId "entity.agent.research"
+                  :orgId "org.open-hax" :principalKind "agent"}})
 
 (deftest ^:async causal-lifecycle-test
   (let [accepted* (atom [])
-        id-fn (sequential-id-fn
-               ["turn-1" "episode-1"
-                "event-1" "event-2" "event-3" "event-4"])
         episode (episode-ledger/create-episode
-                 {:event-ledger-id-fn id-fn
-                  :sol-node-id "sol.node.local"
-                  :event-ledger-append!
-                  (fn [envelope]
-                    (swap! accepted* conj envelope)
-                    (js/Promise.resolve envelope))}
+                 {:sol-node-id "sol.node.local"
+                  :clio/append! (fn [event]
+                                  (swap! accepted* conj event)
+                                  (js/Promise.resolve :appended))}
                  episode-input)]
-    (doseq [event-type ["sol.run.started"
-                        "sol.turn.started"
-                        "sol.turn.completed"
-                        "sol.run.completed"]]
-      (await (episode-ledger/emit! episode event-type {:status "ok"})))
-    (let [events @accepted*]
-      (is (= ["sol.run.started"
-              "sol.turn.started"
-              "sol.turn.completed"
-              "sol.run.completed"]
+    (doseq [type [:sol.run/started :sol.turn/started
+                  :sol.turn/completed :sol.run/completed]]
+      (await (episode-ledger/emit! episode type {:status "ok"})))
+    (let [events @accepted* ids (mapv :event/id events)]
+      (is (= [:sol.run/started :sol.turn/started :sol.turn/completed :sol.run/completed]
              (mapv :event/type events)))
-      (is (= ["event-1" "event-2" "event-3" "event-4"]
-             (mapv :event/id events)))
-      (is (= [nil "event-1" "event-2" "event-3"]
-             (mapv :causal/parent events)))
-      (is (= #{"event-1"} (set (map :causal/root events))))
-      (is (= #{"turn-1"} (set (map :turn/id events))))
-      (is (= #{"episode-1"} (set (map :episode/id events))))
-      (is (= #{"run-1"} (set (map :run/id events))))
+      (is (= [1 2 3 4] (mapv :event/seq events)))
+      (is (= [[] [(ids 0)] [(ids 1)] [(ids 2)]] (mapv :event/causes events)))
+      (is (= #{(first ids)} (set (map #(get-in % [:event/data :causal/root]) events))))
+      (is (= 1 (count (set (map :event/stream events)))))
+      (is (= #{"run-1"} (set (map #(get-in % [:event/data :run/id]) events))))
       (is (= #{"org.open-hax"}
-             (set (map #(get-in % [:event/from :principal/binding
-                                   :principal/org-id])
-                       events)))))))
+             (set (map #(get-in % [:event/data :event/from :principal/binding
+                                   :principal/org-id]) events))))
+      (doseq [event events]
+        (is (= event (schema/validate-event! [(:revision episode)] event)))))))
 
 (deftest ^:async no-appender-remains-valid-test
-  (let [episode (episode-ledger/create-episode
-                 {:event-ledger-id-fn
-                  (sequential-id-fn ["turn-1" "episode-1" "event-1"])}
-                 (assoc episode-input :auth-context nil))
-        envelope (await (episode-ledger/emit!
-                         episode
-                         "sol.run.started"
-                         {:status "running"}))]
+  (let [episode (episode-ledger/create-episode {} (assoc episode-input :auth-context nil))
+        event (await (episode-ledger/emit! episode "sol.run.started" {:status "running"}))]
     (is (false? (episode-ledger/configured? episode)))
-    (is (= "sol.run.started" (:event/type envelope)))
-    (is (= "event-1" (:causal/root envelope)))
-    (is (= "actor.agent.research" (get-in envelope [:event/from :actor-id])))
-    (is (not (contains? (:event/from envelope) :principal/binding)))))
+    (is (= :sol.run/started (:event/type event)))
+    (is (= (:event/id event) (get-in event [:event/data :causal/root])))
+    (is (= "actor.agent.research" (:event/actor event)))
+    (is (not (contains? (get-in event [:event/data :event/from]) :principal/binding)))
+    (is (= event (schema/validate-event! [(:revision episode)] event)))))
 
-(deftest ^:async configured-db-delegates-to-event-ledger-test
-  (let [calls* (atom [])
-        db {:name "ledger-db"}
-        append! (episode-ledger/configured-appender
-                 {:event-ledger-db db})]
-    (with-redefs [event-ledger/append-event
-                  (fn [actual-db envelope]
-                    (swap! calls* conj [actual-db envelope])
-                    (js/Promise.resolve envelope))]
-      (let [result (await (append! {:event/type "test"}))]
-        (is (= {:event/type "test"} result))
-        (is (= [[db {:event/type "test"}]] @calls*))))))
+(deftest unsupported-mongo-test
+  (is (thrown-with-msg? cljs.core/ExceptionInfo #"Mongo"
+        (episode-ledger/configured-appender {:event-ledger-db {:name "old-db"}})))
+  (is (thrown-with-msg? cljs.core/ExceptionInfo #"explicit"
+        (episode-ledger/configured-appender {:event-ledger-append! identity}))))
 
-(deftest ^:async rejected-append-does-not-advance-causality-test
-  (let [attempts* (atom 0)
+(deftest ^:async retry-retains-constructed-event-test
+  (let [attempts* (atom [])
         episode (episode-ledger/create-episode
-                 {:event-ledger-id-fn
-                  (sequential-id-fn ["turn-1" "episode-1" "event-1" "event-2"])
-                  :event-ledger-append!
-                  (fn [envelope]
-                    (swap! attempts* inc)
-                    (if (= 1 @attempts*)
-                      (js/Promise.reject (js/Error. "ledger unavailable"))
-                      (js/Promise.resolve envelope)))}
+                 {:clio/append! (fn [event]
+                                  (swap! attempts* conj event)
+                                  (if (= 1 (count @attempts*))
+                                    (js/Promise.reject (js/Error. "ack lost after append"))
+                                    (js/Promise.resolve :already-present)))}
                  episode-input)]
     (try
-      (await (episode-ledger/emit! episode "sol.run.started" {}))
-      (is false "first append should reject")
+      (await (episode-ledger/emit! episode "sol.run.started" {:status "running"}))
+      (is false "first acknowledgement should reject")
+      (catch :default _ nil))
+    (is (= 0 @(:sequence* episode)))
+    (is (nil? @(:parent-id* episode)))
+    (let [accepted (await (episode-ledger/emit! episode "sol.run.started" {:status "running"}))]
+      (is (= (first @attempts*) (second @attempts*) accepted))
+      (is (= 1 (:event/seq accepted)))
+      (is (= [] (:event/causes accepted)))
+      (is (= 1 @(:sequence* episode))))))
+
+(deftest ^:async non-admission-result-is-not-accepted-test
+  (let [episode (episode-ledger/create-episode {:clio/append! identity} episode-input)]
+    (try
+      (await (episode-ledger/emit! episode :sol.run/started {}))
+      (is false "Returning event data is not upstream append admission")
       (catch :default error
-        (is (= "ledger unavailable" (.-message error)))))
-    (let [accepted (await (episode-ledger/emit!
-                          episode
-                          "sol.run.started"
-                          {}))]
-      (is (= "event-2" (:event/id accepted)))
-      (is (= "event-2" (:causal/root accepted)))
-      (is (nil? (:causal/parent accepted))))))
+        (is (re-find #"admission result" (.-message error)))))
+    (is (= 0 @(:sequence* episode)))
+    (is (some? @(:pending* episode)))))
+
+(deftest ^:async equivalent-empty-payload-retries-one-event-test
+  (let [attempts* (atom [])
+        e (episode-ledger/create-episode
+           {:clio/append! (fn [event]
+                            (swap! attempts* conj event)
+                            (if (= 1 (count @attempts*))
+                              (throw (ex-info "lost acknowledgement" {}))
+                              :appended))}
+           episode-input)]
+    (try (await (episode-ledger/emit! e :sol.run/started nil)) (catch :default _ nil))
+    (await (episode-ledger/emit! e :sol.run/started {}))
+    (is (= 2 (count @attempts*)) "Equivalent shaped payload must retry only")
+    (is (= 1 @(:sequence* e)))))

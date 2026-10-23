@@ -54,9 +54,10 @@ dependency DAG.
 - Node and npm modules (`node:*`, `fastify`, `ws`, `typebox`,
   `@modelcontextprotocol/sdk`) are runtime imports via
   `:keep-as-import`; do not let them leak above `extern/`.
-- The shadow build pulls sibling packages `../katamorph/src/cljs` and
-  `../event-ledger/src` onto the source path. Treat those as read-only upstream
-  dependencies — fix them in their own packages, not here.
+- `shadow-cljs.edn` uses `:deps true`. `deps.edn` consumes Katamorph and
+  Clio at immutable Git revisions, not sibling source directories.
+  Treat those as read-only upstream dependencies; fix their laws in their
+  owning repositories before changing Sol's pins.
 - No retrieval/RAG layer lives in Sol; `chat` and `direct` routes run the same
   plain turn. If retrieval is added it belongs in front of the turn (context
   injection or a tool), not threaded through the agent loop as a mode.
@@ -74,10 +75,37 @@ dependency DAG.
   `open-hax.sol.*`.
 - **eta-mu runtime**: Sol runs agent turns on the turn-processor run-loop
   (`eta-mu.turn-processor.infra.loop`) with `eta-mu.extern.openai` streaming,
-  consumed as workspace source paths (`../turn-processor/src/cljs`,
-  `../eta-mu/src/cljs` in `deps.edn`). The provider adapter under
+  consumed at an immutable eta-mu Git revision with `:deps/root` selecting
+  `packages/turn-processor` and `packages/eta-mu` in `deps.edn`. The adapter under
   `infra/agent/provider/` wires them into `IAgentProviderAdapter`; sol no
   longer consumes the legacy coding-agent CLI package.
+
+## Proposed persistent review hosting
+
+[The phase-one proposal](docs/design/persistent-review-workers.md) and its
+[EDN integration contract](docs/design/persistent-review-workers.edn) are
+planning artifacts, not loaded runtime resources or a deployed service.
+They refine [Foresight story 330aa63f](https://github.com/open-hax/foresight/pull/122)
+without changing that card's Rheos state. Planning settlement and an actual
+Rheos-ready admission precede implementation and service activation.
+
+Eta-mu owns review admission, policy and GitHub publication; Sol owns execution;
+Knoxx owns the authenticated API/projection; Clio owns immutable
+records; Katamorph owns reusable resource shapes; Services owns deployment.
+Extend Sol's existing agent service and turn processor. Do not create a second
+agent loop, local board parser, local event-envelope law or publisher identity.
+Candidate tools receive neither App signing nor deployment credentials.
+
+The bounded [Clio cutover](docs/design/sol-clio-cutover.md) consumes the actual
+upstream envelope/catalog/admission API. Filesystem persistence is explicitly
+opt-in; it does not qualify durable acknowledgement, old-history migration,
+lease/fence behavior or persistent review hosting.
+
+For every pull-request interaction, read
+`~/.agents/skills/pr-flow/SKILL.md`. The canonical skill pack owns invitation,
+review convergence and merge policy; follow the user’s current all-available
+agent instruction. Keep repository instructions as a pointer rather than
+copying that policy here.
 
 ## Verification
 
@@ -85,7 +113,11 @@ A task is not done while any relevant suite is failing.
 
 ```bash
 pnpm lint        # clj-kondo, must be zero warnings
-pnpm test        # shadow-cljs compile test (autoruns target/test/test.cjs)
+pnpm test        # local compiler + completed, nonempty CLJS result guard
+pnpm test:guard  # Node guard regressions, including false-success cases
+pnpm check:startup # isolated localhost health + SIGTERM, never a daemon
+pnpm build:clio-native # test-only ESM transport probe
+pnpm check:clio-native # real append/retry/reopen, no provider inference
 pnpm build       # shadow-cljs compile server — also do this for runtime changes;
                  # the test build can pass while the server build fails
 ```

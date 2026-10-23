@@ -98,9 +98,9 @@
    :ingest_source             "IngestSourceContract"})
 
 (defn- guard-owned-names
-  "Parse the OWNED list out of scripts/contract-guard.mjs (cwd = packages/sol)."
+  "Parse the OWNED list out of scripts/contract-guard.mjs (cwd = standalone Sol)."
   []
-  (let [src (fs/readFileSync "../../scripts/contract-guard.mjs" "utf8")
+  (let [src (fs/readFileSync "scripts/contract-guard.mjs" "utf8")
         block (second (re-find #"(?s)export const OWNED = \[(.*?)\];" src))]
     (set (map second (re-seq #"\"([A-Za-z]+)\"" (or block ""))))))
 
