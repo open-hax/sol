@@ -104,8 +104,8 @@
         (lifecycle/remember-context! runtime cfg nil false)
         (await (start-http! runtime cfg))))
     (catch :default err
-      (.error js/console "Sol backend failed to start" err)
-      (js/process.exit 1))))
+      (xconsole/error! "Sol backend failed to start" err)
+      (process/exit! 1))))
 
 (defn ^:async ^:dev/before-load-async stop-http-before-load!
   [done]

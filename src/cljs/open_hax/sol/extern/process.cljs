@@ -7,3 +7,8 @@
   (let [value (and name (aget js/process.env name))]
     (when (string? value)
       value)))
+
+(defn exit!
+  "Terminate the host process with the given exit code."
+  [code]
+  (js/process.exit code))
