@@ -18,3 +18,13 @@
   spore: none
   receipt-refs: 953d34fb046aa88ca2454b8269a361ac235bd76fee09871163ae678317f9ba03
   note: "Keep runtime pins in generated callers; preserve incoming frontmatter and append-only accountability. Shared service proof and member exact-head hosted proof remain distinct."
+
+- ts: 2026-10-23T09:42:00.487706Z
+  session: codex/foresight-antigravity-rollout
+  task: Publish sol R5 reviewer runtime pin
+  p-efficiency: 0.95
+  p-friction: 0.05
+  p-skill-candidate: 0.0
+  spore: none
+  receipt-refs: 6de78fc07bb66d9d890678a6bb0d432ef388389a59291d66e0699c073a11ecce
+  note: "Bound changes to the exact runtime pin and required accountability; preserve prior bytes, incoming state and branch policy. Native service proof does not qualify a later member head."
