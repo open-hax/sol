@@ -47,6 +47,14 @@
       (str/replace "(defprotocol IAgentService" ";; IAgentService was here\n(def removed-protocol \"IAgentService\")\n(defprotocol RemovedService")
       (str/replace #"(?m)^(\s+)IAgentService\s*$" "$1RemovedService")))
 
+(defn with-service-anchor-discarded
+  "Keep IAgentService only inside a `#_` discarded form, which the reader
+   drops."
+  [source]
+  (-> source
+      (str/replace "(defprotocol IAgentService" "#_(defprotocol IAgentService)\n(defprotocol RemovedService")
+      (str/replace #"(?m)^(\s+)IAgentService\s*$" "$1RemovedService")))
+
 (deftest complete-inventory-passes
   (is (zero? (:exit (check-fixture original-plan)))))
 
@@ -118,6 +126,17 @@
         (is (str/includes? edited ";; IAgentService"))
         (is (str/includes? edited "\"IAgentService\""))
         (is (not (str/includes? edited "defprotocol IAgentService"))))
+      (let [result (check-fixture original-plan root)]
+        (is (= 1 (:exit result)))
+        (is (re-find #"Anchor drift" (:err result))))
+      (finally (delete-tree root)))))
+
+(deftest anchor-only-in-discarded-form-is-rejected
+  (let [root (copied-source-root service-path with-service-anchor-discarded)]
+    (try
+      (let [edited (slurp (io/file root service-path))]
+        (is (str/includes? edited "#_(defprotocol IAgentService)"))
+        (is (= 1 (count (re-seq #"IAgentService" edited)))))
       (let [result (check-fixture original-plan root)]
         (is (= 1 (:exit result)))
         (is (re-find #"Anchor drift" (:err result))))
