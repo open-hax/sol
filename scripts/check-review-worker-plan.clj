@@ -2,7 +2,9 @@
 ;; Structural check of a proposal only; not a runtime, resource or board validator.
 (require '[clojure.edn :as edn]
          '[clojure.java.io :as io]
-         '[clojure.string :as str])
+         '[clojure.string :as str]
+         '[rewrite-clj.node :as node]
+         '[rewrite-clj.parser :as parser])
 
 (defn require-check! [valid? message]
   (when-not valid?
@@ -39,40 +41,23 @@
                   [lib (select-keys options [:git/sha :git/tag :deps/root])])))
         (:deps deps)))
 
-(defn code-text
-  "Source with `;` line comments, string and regex literals (with escapes) and
-   character literals blanked, so anchors match only code. Line breaks are
-   kept. `#_` discarded forms are still treated as code."
+(defn code-symbols
+  "Symbol tokens the reader keeps in source. Comments, `#_` discarded forms,
+   strings, regexes, character literals and keywords are excluded, so anchors
+   match only active code."
   [source]
-  (let [sb (StringBuilder.)
-        n (count source)]
-    (loop [i 0 state :code]
-      (if (>= i n)
-        (str sb)
-        (let [c (.charAt ^String source i)]
-          (case state
-            :code (cond
-                    (= c \;) (do (.append sb \space) (recur (inc i) :comment))
-                    (= c \") (do (.append sb \space) (recur (inc i) :string))
-                    (= c \\) (do (.append sb "  ") (recur (+ i 2) :code))
-                    :else (do (.append sb c) (recur (inc i) :code)))
-            :comment (if (= c \newline)
-                       (do (.append sb c) (recur (inc i) :code))
-                       (do (.append sb \space) (recur (inc i) :comment)))
-            :string (cond
-                      (= c \\) (do (.append sb "  ") (recur (+ i 2) :string))
-                      (= c \") (do (.append sb \space) (recur (inc i) :code))
-                      :else (do (.append sb (if (= c \newline) c \space)) (recur (inc i) :string)))))))))
+  (let [root (parser/parse-string-all source)
+        kept? (fn [node] (and (node/inner? node) (not= :uneval (node/tag node))))]
+    (into #{}
+          (comp (filter #(and (= :token (node/tag %)) (symbol? (:value %))))
+                (map node/string))
+          (tree-seq kept? node/children root))))
 
 (defn code-token?
-  "True when anchor occurs in code as a whole symbol token, not inside a
-   longer symbol, comment or string."
+  "True when anchor is a whole symbol token in active code, not part of a
+   longer symbol, a comment, a string or a discarded form."
   [source anchor]
-  (boolean
-   (re-find (re-pattern (str "(?<![\\w*+!?<>=/.:#'&$%-])"
-                             (java.util.regex.Pattern/quote anchor)
-                             "(?![\\w*+!?<>=/.:#'&$%-])"))
-            (code-text source))))
+  (contains? (code-symbols source) anchor))
 
 (defn check-plan!
   ([proposal-path] (check-plan! proposal-path "."))
