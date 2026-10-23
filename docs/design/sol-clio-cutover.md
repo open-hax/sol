@@ -91,7 +91,7 @@ schema revision.
 | Capability | Observed gap / proper follow-up |
 | --- | --- |
 | Mongo persistence | Clio (788cdd and current 9b14cda) has no Mongo adapter/storage protocol. Add transport upstream if required, then consume it; no implicit conversion here. |
-| Durable acknowledgement | Upstream locked append calls `appendFileSync` without `fsync`/`fdatasync`. This slice proves native append acceptance, not power-loss durability. The worker contract still requires upstream proof/capability. |
+| Durable acknowledgement | At pinned Clio 9b14cda, locked append calls `appendFileSync`, then `fsyncSync` on the ledger descriptor and an `fsync` of its parent directory before returning `:appended` (exact retries reflush both before `:already-present`). This slice exercises that native path but does not itself prove power-loss durability (no crash/fault-injection test here; guarantees still depend on the filesystem and storage honouring `fsync`). The worker contract still requires upstream proof/capability. |
 | Legacy continuity | No predecessor bridge is exposed. Arbitrary old IDs, envelope versions and Mongo global sequence cannot be treated as Clio UUIDs/per-stream history. Preserve old bytes; admit migration upstream separately. |
 | Lease/fence/restart intent | An inode append lock and process-local pending data are not a worker lease, monotonic fence or restart intent store. Existing worker requirements remain unsatisfied. |
 | Incremental replay | This revision canonicalizes complete history. No suffix-only/checkpoint recovery claim is made. |
