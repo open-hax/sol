@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import test from 'node:test';
 import { mkdtempSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -123,6 +124,42 @@ test('a pipe holder outside the reaped tree fails instead of hanging', {
   if (grandchild) try { process.kill(grandchild, 'SIGKILL'); } catch {}
   assert.equal(result.code, 1);
   assert.equal(result.reason, 'descendant-held-pipes');
+});
+
+test('a SIGTERM or SIGINT to the runner kills the compiler group', {
+  timeout: 20_000,
+  // POSIX only: the compiler runs in its own process group there, so a
+  // terminal signal to the runner never reaches it on its own.
+  skip: process.platform === 'win32',
+}, async () => {
+  const runnerUrl = new URL('./run-shadow-tests-ci.mjs', import.meta.url).href;
+  for (const signal of ['SIGTERM', 'SIGINT']) {
+    const compiler = "process.stdout.write('COMPILER ' + process.pid + '\\n'); setInterval(() => {}, 1000);";
+    const wrapper = [
+      `const { runShadowTests } = await import(${JSON.stringify(runnerUrl)});`,
+      `await runShadowTests({ command: process.execPath, args: ['-e', ${JSON.stringify(compiler)}], timeoutMs: 60_000 });`,
+    ].join(' ');
+    const runner = spawn(process.execPath, ['--input-type=module', '-e', wrapper], { stdio: ['ignore', 'pipe', 'ignore'] });
+    let seen = '';
+    const compilerPid = await new Promise((resolve, reject) => {
+      runner.stdout.on('data', (chunk) => {
+        seen += chunk.toString();
+        const match = /COMPILER (\d+)/.exec(seen);
+        if (match) resolve(Number(match[1]));
+      });
+      runner.on('exit', () => reject(new Error(`runner exited before the compiler started: ${seen}`)));
+    });
+    const exited = new Promise((resolve) => runner.on('exit', (code, sig) => resolve({ code, sig })));
+    runner.kill(signal);
+    const outcome = await exited;
+    let alive = true;
+    for (let i = 0; i < 50 && alive; i += 1) {
+      try { process.kill(compilerPid, 0); await new Promise((r) => setTimeout(r, 100)); } catch { alive = false; }
+    }
+    if (alive) try { process.kill(compilerPid, 'SIGKILL'); } catch {}
+    assert.equal(alive, false, `compiler ${compilerPid} survived ${signal} to the runner`);
+    assert.equal(outcome.sig, signal);
+  }
 });
 
 test('direct execution through a symlinked path is still recognised', () => {
