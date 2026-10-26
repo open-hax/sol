@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import test from 'node:test';
-import { mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -126,6 +126,20 @@ test('a pipe holder outside the reaped tree fails instead of hanging', {
   assert.equal(result.reason, 'descendant-held-pipes');
 });
 
+// A killed compiler can stay a zombie (state Z) when PID 1 does not reap
+// adopted children, and signal 0 still succeeds for a zombie. Treat that
+// state as stopped on Linux; elsewhere fall back to signal 0 alone.
+function processStopped(pid) {
+  try { process.kill(pid, 0); } catch { return true; }
+  if (process.platform !== 'linux') return false;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    return stat.slice(stat.lastIndexOf(')') + 2).startsWith('Z');
+  } catch {
+    return true;
+  }
+}
+
 test('a SIGTERM or SIGINT to the runner kills the compiler group', {
   timeout: 20_000,
   // POSIX only: the compiler runs in its own process group there, so a
@@ -154,7 +168,8 @@ test('a SIGTERM or SIGINT to the runner kills the compiler group', {
     const outcome = await exited;
     let alive = true;
     for (let i = 0; i < 50 && alive; i += 1) {
-      try { process.kill(compilerPid, 0); await new Promise((r) => setTimeout(r, 100)); } catch { alive = false; }
+      if (processStopped(compilerPid)) alive = false;
+      else await new Promise((r) => setTimeout(r, 100));
     }
     if (alive) try { process.kill(compilerPid, 'SIGKILL'); } catch {}
     assert.equal(alive, false, `compiler ${compilerPid} survived ${signal} to the runner`);
