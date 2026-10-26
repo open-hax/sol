@@ -90,22 +90,22 @@
 (defn ^:async bootstrap!
   "Main entrypoint called by shadow-cljs."
   []
-  (let [cfg (clio-store/configure!
-             (contract-runtime-deps/inject-deps!
-              (runtime-models/enrich-config (runtime-config/cfg) process/env-var)))
-        base-dir (path/join (path/cwd) ".ημ" "sol")
-        session-store (session-store/create-edn-session-store
-                       (path/join base-dir "sessions") (:clio/store cfg))
-        run-state-store (run-state/create-edn-run-state-store (path/join base-dir "runs"))]
-    (session-store/set-default-store! session-store)
-    (run-state/set-default-store! run-state-store)
-    (let [runtime #js {:sessionStore session-store :runStateStore run-state-store}]
-      (lifecycle/remember-context! runtime cfg nil false)
-      (try
-        (await (start-http! runtime cfg))
-        (catch :default err
-          (.error js/console "Sol backend failed to start" err)
-          (js/process.exit 1))))))
+  (try
+    (let [cfg (clio-store/configure!
+               (contract-runtime-deps/inject-deps!
+                (runtime-models/enrich-config (runtime-config/cfg) process/env-var)))
+          base-dir (path/join (path/cwd) ".ημ" "sol")
+          session-store (session-store/create-edn-session-store
+                         (path/join base-dir "sessions") (:clio/store cfg))
+          run-state-store (run-state/create-edn-run-state-store (path/join base-dir "runs"))]
+      (session-store/set-default-store! session-store)
+      (run-state/set-default-store! run-state-store)
+      (let [runtime #js {:sessionStore session-store :runStateStore run-state-store}]
+        (lifecycle/remember-context! runtime cfg nil false)
+        (await (start-http! runtime cfg))))
+    (catch :default err
+      (xconsole/error! "Sol backend failed to start" err)
+      (process/exit! 1))))
 
 (defn ^:async ^:dev/before-load-async stop-http-before-load!
   [done]

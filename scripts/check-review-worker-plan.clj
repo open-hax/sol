@@ -2,7 +2,9 @@
 ;; Structural check of a proposal only; not a runtime, resource or board validator.
 (require '[clojure.edn :as edn]
          '[clojure.java.io :as io]
-         '[clojure.string :as str])
+         '[clojure.string :as str]
+         '[rewrite-clj.node :as node]
+         '[rewrite-clj.parser :as parser])
 
 (defn require-check! [valid? message]
   (when-not valid?
@@ -39,7 +41,27 @@
                   [lib (select-keys options [:git/sha :git/tag :deps/root])])))
         (:deps deps)))
 
-(defn check-plan! [proposal-path]
+(defn code-symbols
+  "Symbol tokens the reader keeps in source. Comments, `#_` discarded forms,
+   strings, regexes, character literals and keywords are excluded, so anchors
+   match only active code."
+  [source]
+  (let [root (parser/parse-string-all source)
+        kept? (fn [node] (and (node/inner? node) (not= :uneval (node/tag node))))]
+    (into #{}
+          (comp (filter #(and (= :token (node/tag %)) (symbol? (:value %))))
+                (map node/string))
+          (tree-seq kept? node/children root))))
+
+(defn code-token?
+  "True when anchor is a whole symbol token in active code, not part of a
+   longer symbol, a comment, a string or a discarded form."
+  [source anchor]
+  (contains? (code-symbols source) anchor))
+
+(defn check-plan!
+  ([proposal-path] (check-plan! proposal-path "."))
+  ([proposal-path source-root]
   (let [plan (edn/read-string (slurp proposal-path))
         deps (edn/read-string (slurp "deps.edn"))
         expected-pins (declared-git-pins deps)
@@ -62,8 +84,8 @@
     (doseq [{:keys [path namespace anchor gap]} points]
       (require-check! (and (keyword? gap) (not (str/blank? (name gap))))
                       (str "Missing integration gap: " path))
-      (require-check! (.isFile (io/file path)) (str "Missing integration file: " path))
-      (let [source (slurp path)
+      (require-check! (.isFile (io/file source-root path)) (str "Missing integration file: " path))
+      (let [source (slurp (io/file source-root path))
             ns-form (binding [*read-eval* false]
                       (read (java.io.PushbackReader. (java.io.StringReader. source))))]
         (require-check! (and (= 'ns (first ns-form))
@@ -73,13 +95,14 @@
                         (str "Blank integration anchor: " path))
         (require-check! (= (get expected-integration-anchors path) anchor)
                         (str "Unexpected integration anchor: " path))
-        (require-check! (str/includes? source anchor) (str "Anchor drift: " path))))
+        (require-check! (code-token? source anchor) (str "Anchor drift: " path))))
     {:proposal (:proposal/id plan) :status :proposed
      :dependency-pins (count (:dependencies plan)) :integration-files (count points)
-     :runtime-validated? false :board-validated? false :deployment-validated? false}))
+     :runtime-validated? false :board-validated? false :deployment-validated? false})))
 
 (try
-  (prn (check-plan! (or (first *command-line-args*) "docs/design/persistent-review-workers.edn")))
+  (prn (check-plan! (or (first *command-line-args*) "docs/design/persistent-review-workers.edn")
+                    (or (second *command-line-args*) ".")))
   (catch Exception error
     (binding [*out* *err*] (println "Proposal check failed:" (.getMessage error)))
     (System/exit 1)))
