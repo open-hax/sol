@@ -135,8 +135,10 @@ function processStopped(pid) {
   try {
     const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
     return stat.slice(stat.lastIndexOf(')') + 2).startsWith('Z');
-  } catch {
-    return true;
+  } catch (error) {
+    // ENOENT means the pid exited between the two checks. Any other read
+    // failure (procfs hidden or restricted) proves nothing, so keep polling.
+    return error.code === 'ENOENT';
   }
 }
 
@@ -148,31 +150,44 @@ test('a SIGTERM or SIGINT to the runner kills the compiler group', {
 }, async () => {
   const runnerUrl = new URL('./run-shadow-tests-ci.mjs', import.meta.url).href;
   for (const signal of ['SIGTERM', 'SIGINT']) {
-    const compiler = "process.stdout.write('COMPILER ' + process.pid + '\\n'); setInterval(() => {}, 1000);";
+    // The compiler also starts a child in its own group, so the test fails if
+    // the handler stops the group leader but leaves a descendant running.
+    const compiler = [
+      "const { spawn } = require('node:child_process');",
+      "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000);'], { stdio: 'ignore' });",
+      "process.stdout.write('COMPILER ' + process.pid + ' CHILD ' + child.pid + '\\n');",
+      "setInterval(() => {}, 1000);",
+    ].join(' ');
     const wrapper = [
       `const { runShadowTests } = await import(${JSON.stringify(runnerUrl)});`,
       `await runShadowTests({ command: process.execPath, args: ['-e', ${JSON.stringify(compiler)}], timeoutMs: 60_000 });`,
     ].join(' ');
     const runner = spawn(process.execPath, ['--input-type=module', '-e', wrapper], { stdio: ['ignore', 'pipe', 'ignore'] });
     let seen = '';
-    const compilerPid = await new Promise((resolve, reject) => {
+    const pids = await new Promise((resolve, reject) => {
       runner.stdout.on('data', (chunk) => {
         seen += chunk.toString();
-        const match = /COMPILER (\d+)/.exec(seen);
-        if (match) resolve(Number(match[1]));
+        const match = /COMPILER (\d+) CHILD (\d+)/.exec(seen);
+        if (match) resolve({ compiler: Number(match[1]), child: Number(match[2]) });
       });
       runner.on('exit', () => reject(new Error(`runner exited before the compiler started: ${seen}`)));
     });
     const exited = new Promise((resolve) => runner.on('exit', (code, sig) => resolve({ code, sig })));
     runner.kill(signal);
     const outcome = await exited;
-    let alive = true;
-    for (let i = 0; i < 50 && alive; i += 1) {
-      if (processStopped(compilerPid)) alive = false;
-      else await new Promise((r) => setTimeout(r, 100));
+    const survivors = [];
+    for (const [label, pid] of Object.entries(pids)) {
+      let alive = true;
+      for (let i = 0; i < 50 && alive; i += 1) {
+        if (processStopped(pid)) alive = false;
+        else await new Promise((r) => setTimeout(r, 100));
+      }
+      if (alive) {
+        survivors.push(`${label} ${pid}`);
+        try { process.kill(pid, 'SIGKILL'); } catch {}
+      }
     }
-    if (alive) try { process.kill(compilerPid, 'SIGKILL'); } catch {}
-    assert.equal(alive, false, `compiler ${compilerPid} survived ${signal} to the runner`);
+    assert.deepEqual(survivors, [], `survived ${signal} to the runner: ${survivors.join(', ')}`);
     assert.equal(outcome.sig, signal);
   }
 });
