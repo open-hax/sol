@@ -88,11 +88,24 @@ export function runShadowTests({
     let leaderAlive = true;
     let settled = false;
     let graceTimer;
+    // A terminal Ctrl-C or a CI cancel reaches only the runner's own group, not
+    // the detached compiler group: kill that tree, then re-raise the signal so
+    // the runner still terminates the way it would have without a handler.
+    const forwardSignal = (signal) => {
+      process.removeListener('SIGINT', forwardSignal);
+      process.removeListener('SIGTERM', forwardSignal);
+      killCompilerTree(child.pid, grouped, leaderAlive, stderr);
+      process.kill(process.pid, signal);
+    };
+    process.once('SIGINT', forwardSignal);
+    process.once('SIGTERM', forwardSignal);
     const finish = (result) => {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
       clearTimeout(graceTimer);
+      process.removeListener('SIGINT', forwardSignal);
+      process.removeListener('SIGTERM', forwardSignal);
       if (result.code !== 0) stderr(`[sol-test] Rejected test execution: ${result.reason}\n`);
       resolve(result);
     };
