@@ -188,3 +188,40 @@
         (run-state/set-default-store! (second saved))
         (reset! core/auto-session-store* (nth saved 2))
         (fs/remove-tree! root)))))
+
+(deftest ^:async rejected-start-leaves-runtime-state-untouched-test
+  ;; start! must not write config*/runtime* before register-app-routes! has
+  ;; checked store compatibility; otherwise a rejected start! leaves config*
+  ;; describing a Clio store no running app uses.
+  (let [root-a (scratch)
+        root-b (scratch)
+        resolve-original core/resolve-app-config
+        register-original app-routes/register-routes!
+        saved [@session-store/default-store* @run-state/default-store* @core/auto-session-store*
+               @runtime-state/config* @runtime-state/runtime*]]
+    (try
+      (reset-stores!)
+      (register-with-stub-routes! (clio-config root-a))
+      (let [config-before @runtime-state/config*
+            runtime-before @runtime-state/runtime*
+            ;; start! is async, so the stubs stay installed until it settles.
+            _ (set! core/resolve-app-config (fn [_] (resolve-original (clio-config root-b))))
+            _ (set! app-routes/register-routes! (fn [_runtime _app resolved] resolved))
+            rejected (try (await (core/start! #js {:marker "rejected"}))
+                          nil
+                          (catch :default e e))]
+        (is (some? rejected) "start! with a different Clio ledger is rejected")
+        (is (identical? config-before @runtime-state/config*)
+            "a rejected start! leaves config* untouched")
+        (is (identical? runtime-before @runtime-state/runtime*)
+            "a rejected start! leaves runtime* untouched"))
+      (finally
+        (set! core/resolve-app-config resolve-original)
+        (set! app-routes/register-routes! register-original)
+        (session-store/set-default-store! (nth saved 0))
+        (run-state/set-default-store! (nth saved 1))
+        (reset! core/auto-session-store* (nth saved 2))
+        (reset! runtime-state/config* (nth saved 3))
+        (reset! runtime-state/runtime* (nth saved 4))
+        (fs/remove-tree! root-a)
+        (fs/remove-tree! root-b)))))
