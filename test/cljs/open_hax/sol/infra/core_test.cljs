@@ -92,3 +92,27 @@
       (finally
         (session-store/set-default-store! (first saved))
         (run-state/set-default-store! (second saved))))))
+
+(deftest re-registration-follows-the-resolved-clio-store-test
+  ;; A retry or second register-app-routes! call must not keep a session store
+  ;; that this path created for a different resolved Clio store.
+  (let [root-a (scratch)
+        root-b (scratch)
+        saved [@session-store/default-store* @run-state/default-store*]]
+    (try
+      (session-store/set-default-store! nil)
+      (run-state/set-default-store! nil)
+      (let [first-resolved (register-with-stub-routes! (clio-config root-a))
+            runs @run-state/default-store*
+            second-resolved (register-with-stub-routes! (clio-config root-b))
+            sessions @session-store/default-store*]
+        (is (not (identical? (:clio/store first-resolved) (:clio/store second-resolved))))
+        (is (identical? (:clio/store second-resolved) (:canonical-store sessions))
+            "the auto-installed session store follows the new Clio store")
+        (is (identical? runs @run-state/default-store*)
+            "the run store has no Clio binding and is kept"))
+      (finally
+        (session-store/set-default-store! (first saved))
+        (run-state/set-default-store! (second saved))
+        (fs/remove-tree! root-a)
+        (fs/remove-tree! root-b)))))
