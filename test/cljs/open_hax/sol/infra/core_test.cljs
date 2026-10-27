@@ -3,6 +3,8 @@
             [clio.extern.js.fs :as fs]
             [open-hax.sol.domain.node.path :as path]
             [open-hax.sol.infra.agent.clio-store :as clio-store]
+            [open-hax.sol.infra.agent.run-state :as run-state]
+            [open-hax.sol.infra.agent.session-store :as session-store]
             [open-hax.sol.infra.core :as core]
             [open-hax.sol.infra.routes.app :as app-routes]
             [open-hax.sol.runtime.state :as runtime-state]))
@@ -46,3 +48,47 @@
 
 (deftest no-clio-paths-means-no-store-test
   (is (nil? (:clio/store (core/resolve-app-config {:host "127.0.0.1" :port 0})))))
+
+(defn- register-with-stub-routes! [config]
+  (let [saved [@runtime-state/config* @runtime-state/runtime*]]
+    (try
+      (with-redefs [app-routes/register-routes! (fn [_runtime _app resolved] resolved)]
+        (core/register-app-routes! #js {} #js {} config))
+      (finally
+        (reset! runtime-state/config* (first saved))
+        (reset! runtime-state/runtime* (second saved))))))
+
+(deftest exported-seams-install-default-stores-test
+  ;; start! and solPlugin skip bootstrap!, so session and run routes would
+  ;; throw "No default Sol session store configured" unless the shared
+  ;; startup path installs the default stores.
+  (let [root (scratch)
+        saved [@session-store/default-store* @run-state/default-store*]]
+    (try
+      (session-store/set-default-store! nil)
+      (run-state/set-default-store! nil)
+      (let [resolved (register-with-stub-routes! (clio-config root))
+            sessions @session-store/default-store*]
+        (is (some? sessions) "session routes have a default store")
+        (is (identical? (:clio/store resolved) (:canonical-store sessions))
+            "the session store writes through the resolved Clio store")
+        (is (some? @run-state/default-store*) "run routes have a default store"))
+      (finally
+        (session-store/set-default-store! (first saved))
+        (run-state/set-default-store! (second saved))
+        (fs/remove-tree! root)))))
+
+(deftest installed-default-stores-are-kept-test
+  ;; bootstrap! installs its stores first; the shared path must not replace them.
+  (let [saved [@session-store/default-store* @run-state/default-store*]
+        sessions (session-store/create-edn-session-store (scratch))
+        runs (run-state/create-edn-run-state-store (scratch))]
+    (try
+      (session-store/set-default-store! sessions)
+      (run-state/set-default-store! runs)
+      (register-with-stub-routes! {:host "127.0.0.1" :port 0})
+      (is (identical? sessions @session-store/default-store*))
+      (is (identical? runs @run-state/default-store*))
+      (finally
+        (session-store/set-default-store! (first saved))
+        (run-state/set-default-store! (second saved))))))
