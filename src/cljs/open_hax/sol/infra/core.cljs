@@ -30,27 +30,43 @@
     (if (map? config) config (runtime-config/cfg))
     process/env-var)))
 
-(defonce ^:private auto-session-store* (atom nil))
+(defonce ^{:doc "The session store this path installed, and whether an app
+   registered successfully with it: {:store s :active? bool}, or nil."}
+  auto-session-store* (atom nil))
 
 (defn ensure-default-stores!
   "start! and solPlugin skip bootstrap!, so install the same default session
    and run stores here when none is configured yet. bootstrap!'s stores, and
    any store installed explicitly, win. A session store this path created is
-   replaced when a later registration resolves a different :clio/store."
+   replaced when a retry after a failed registration resolves a different
+   :clio/store; once an app registered with it, a different :clio/store is
+   rejected before any shared state changes, so a running app's routes and
+   session events keep one ledger."
   [resolved-config]
   (let [base-dir (path/join (path/cwd) ".ημ" "sol")
         canonical (:clio/store resolved-config)
         current @session-store/default-store*
-        ours? (and (some? current) (identical? current @auto-session-store*))]
-    (when (or (nil? current)
-              (and ours? (not (identical? canonical (:canonical-store current)))))
+        {auto :store active? :active?} @auto-session-store*
+        ours? (and (some? current) (identical? current auto))
+        stale? (and ours? (not (identical? canonical (:canonical-store current))))]
+    (when (and stale? active?)
+      (throw (ex-info "A Sol app is already registered with a different :clio/store; the process-wide session store cannot be rebound while it runs."
+                      {:type :sol/incompatible-clio-store})))
+    (when (or (nil? current) stale?)
       (let [store (session-store/create-edn-session-store
                    (path/join base-dir "sessions") canonical)]
-        (reset! auto-session-store* store)
+        (reset! auto-session-store* {:store store :active? false})
         (session-store/set-default-store! store)))
     (when-not @run-state/default-store*
       (run-state/set-default-store!
        (run-state/create-edn-run-state-store (path/join base-dir "runs"))))))
+
+(defn- mark-auto-store-active! []
+  (swap! auto-session-store*
+         (fn [{:keys [store] :as state}]
+           (if (and (some? store) (identical? store @session-store/default-store*))
+             (assoc state :active? true)
+             state))))
 
 (defn register-app-routes!
   [runtime app config]
@@ -58,7 +74,9 @@
     (ensure-default-stores! resolved-config)
     (reset! runtime-state/config* resolved-config)
     (reset! runtime-state/runtime* runtime)
-    (app-routes/register-routes! runtime app resolved-config)))
+    (let [result (app-routes/register-routes! runtime app resolved-config)]
+      (mark-auto-store-active!)
+      result)))
 
 (defn ^:async start!
   [runtime]
