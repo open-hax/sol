@@ -144,13 +144,19 @@
       (let [first-resolved (register-with-stub-routes! (clio-config root-a))
             sessions @session-store/default-store*
             config-before @runtime-state/config*
-            rejected (try (register-with-stub-routes! (clio-config root-b)) nil
-                          (catch :default e e))]
+            ;; Call register-app-routes! directly so config* is read right
+            ;; after the rejection, before any helper cleanup restores it.
+            [rejected config-after]
+            (with-redefs [app-routes/register-routes! (fn [_runtime _app resolved] resolved)]
+              (try (core/register-app-routes! #js {} #js {} (clio-config root-b))
+                   [nil @runtime-state/config*]
+                   (catch :default e [e @runtime-state/config*])))]
         (is (some? rejected) "an incompatible second registration is rejected")
         (is (identical? sessions @session-store/default-store*)
             "the running app's session store is kept")
         (is (identical? (:clio/store first-resolved) (:canonical-store @session-store/default-store*)))
-        (is (identical? config-before @runtime-state/config*))
+        (is (identical? config-before config-after)
+            "the rejected registration leaves config* untouched")
         (register-with-stub-routes! (assoc (clio-config root-a) :clio/store (:clio/store first-resolved)))
         (is (identical? sessions @session-store/default-store*)
             "re-registering with the same Clio store is allowed and keeps the store"))
@@ -160,3 +166,25 @@
         (reset! core/auto-session-store* (nth saved 2))
         (fs/remove-tree! root-a)
         (fs/remove-tree! root-b)))))
+
+(deftest same-paths-re-registration-reuses-the-active-store-test
+  ;; start! retried after a failed .listen, or a second solPlugin call,
+  ;; resolves the same SOL_CLIO_* paths into a freshly opened store object.
+  ;; That is the same ledger, so it must not be rejected; routes reuse the
+  ;; store the running app's session store writes through.
+  (let [root (scratch)
+        saved [@session-store/default-store* @run-state/default-store* @core/auto-session-store*]]
+    (try
+      (reset-stores!)
+      (let [first-resolved (register-with-stub-routes! (clio-config root))
+            sessions @session-store/default-store*
+            again (register-with-stub-routes! (assoc (clio-config root) :clio/initialize? false))]
+        (is (identical? sessions @session-store/default-store*)
+            "the running app's session store is kept")
+        (is (identical? (:clio/store first-resolved) (:clio/store again))
+            "routes reuse the active Clio store for the same paths"))
+      (finally
+        (session-store/set-default-store! (first saved))
+        (run-state/set-default-store! (second saved))
+        (reset! core/auto-session-store* (nth saved 2))
+        (fs/remove-tree! root)))))
