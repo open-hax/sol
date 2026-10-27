@@ -90,8 +90,8 @@
     (let [config (resolve-app-config nil)
           Fastify (js/require "fastify")
           app (Fastify #js {:logger #js {:stream (.-stderr js/process)}})]
-      (reset! runtime-state/config* config)
-      (reset! runtime-state/runtime* runtime)
+      ;; register-app-routes! writes config*/runtime* only after its store
+      ;; compatibility check, so a rejected start! leaves them unchanged.
       (register-app-routes! runtime app config)
       (register-ws-routes! runtime app)
       (await (.listen app #js {:host (:host config) :port (:port config)}))
