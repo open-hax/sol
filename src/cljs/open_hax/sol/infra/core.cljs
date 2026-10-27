@@ -30,15 +30,24 @@
     (if (map? config) config (runtime-config/cfg))
     process/env-var)))
 
+(defonce ^:private auto-session-store* (atom nil))
+
 (defn ensure-default-stores!
   "start! and solPlugin skip bootstrap!, so install the same default session
-   and run stores here when none is configured yet. bootstrap!'s stores win."
+   and run stores here when none is configured yet. bootstrap!'s stores, and
+   any store installed explicitly, win. A session store this path created is
+   replaced when a later registration resolves a different :clio/store."
   [resolved-config]
-  (let [base-dir (path/join (path/cwd) ".ημ" "sol")]
-    (when-not @session-store/default-store*
-      (session-store/set-default-store!
-       (session-store/create-edn-session-store
-        (path/join base-dir "sessions") (:clio/store resolved-config))))
+  (let [base-dir (path/join (path/cwd) ".ημ" "sol")
+        canonical (:clio/store resolved-config)
+        current @session-store/default-store*
+        ours? (and (some? current) (identical? current @auto-session-store*))]
+    (when (or (nil? current)
+              (and ours? (not (identical? canonical (:canonical-store current)))))
+      (let [store (session-store/create-edn-session-store
+                   (path/join base-dir "sessions") canonical)]
+        (reset! auto-session-store* store)
+        (session-store/set-default-store! store)))
     (when-not @run-state/default-store*
       (run-state/set-default-store!
        (run-state/create-edn-run-state-store (path/join base-dir "runs"))))))
