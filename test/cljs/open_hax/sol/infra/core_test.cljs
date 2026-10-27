@@ -93,26 +93,70 @@
         (session-store/set-default-store! (first saved))
         (run-state/set-default-store! (second saved))))))
 
-(deftest re-registration-follows-the-resolved-clio-store-test
-  ;; A retry or second register-app-routes! call must not keep a session store
-  ;; that this path created for a different resolved Clio store.
+(defn- register-failing! [config]
+  (let [saved [@runtime-state/config* @runtime-state/runtime*]]
+    (try
+      (with-redefs [app-routes/register-routes!
+                    (fn [_runtime _app _resolved] (throw (ex-info "route registration failed" {})))]
+        (core/register-app-routes! #js {} #js {} config))
+      (catch :default _ nil)
+      (finally
+        (reset! runtime-state/config* (first saved))
+        (reset! runtime-state/runtime* (second saved))))))
+
+(defn- reset-stores! []
+  (reset! core/auto-session-store* nil)
+  (session-store/set-default-store! nil)
+  (run-state/set-default-store! nil))
+
+(deftest retry-after-failed-registration-follows-the-resolved-clio-store-test
+  ;; A retry after a failed register-app-routes! call must not keep a session
+  ;; store that this path created for a different resolved Clio store.
   (let [root-a (scratch)
         root-b (scratch)
-        saved [@session-store/default-store* @run-state/default-store*]]
+        saved [@session-store/default-store* @run-state/default-store* @core/auto-session-store*]]
     (try
-      (session-store/set-default-store! nil)
-      (run-state/set-default-store! nil)
-      (let [first-resolved (register-with-stub-routes! (clio-config root-a))
-            runs @run-state/default-store*
-            second-resolved (register-with-stub-routes! (clio-config root-b))
+      (reset-stores!)
+      (register-failing! (clio-config root-a))
+      (let [runs @run-state/default-store*
+            resolved (register-with-stub-routes! (clio-config root-b))
             sessions @session-store/default-store*]
-        (is (not (identical? (:clio/store first-resolved) (:clio/store second-resolved))))
-        (is (identical? (:clio/store second-resolved) (:canonical-store sessions))
-            "the auto-installed session store follows the new Clio store")
+        (is (identical? (:clio/store resolved) (:canonical-store sessions))
+            "the auto-installed session store follows the retried Clio store")
         (is (identical? runs @run-state/default-store*)
             "the run store has no Clio binding and is kept"))
       (finally
         (session-store/set-default-store! (first saved))
         (run-state/set-default-store! (second saved))
+        (reset! core/auto-session-store* (nth saved 2))
+        (fs/remove-tree! root-a)
+        (fs/remove-tree! root-b)))))
+
+(deftest active-app-store-is-not-rebound-test
+  ;; Once an app registered successfully, its routes write through the session
+  ;; store's Clio ledger. A second registration with a different Clio store
+  ;; must be rejected before any shared state changes.
+  (let [root-a (scratch)
+        root-b (scratch)
+        saved [@session-store/default-store* @run-state/default-store* @core/auto-session-store*]]
+    (try
+      (reset-stores!)
+      (let [first-resolved (register-with-stub-routes! (clio-config root-a))
+            sessions @session-store/default-store*
+            config-before @runtime-state/config*
+            rejected (try (register-with-stub-routes! (clio-config root-b)) nil
+                          (catch :default e e))]
+        (is (some? rejected) "an incompatible second registration is rejected")
+        (is (identical? sessions @session-store/default-store*)
+            "the running app's session store is kept")
+        (is (identical? (:clio/store first-resolved) (:canonical-store @session-store/default-store*)))
+        (is (identical? config-before @runtime-state/config*))
+        (register-with-stub-routes! (assoc (clio-config root-a) :clio/store (:clio/store first-resolved)))
+        (is (identical? sessions @session-store/default-store*)
+            "re-registering with the same Clio store is allowed and keeps the store"))
+      (finally
+        (session-store/set-default-store! (first saved))
+        (run-state/set-default-store! (second saved))
+        (reset! core/auto-session-store* (nth saved 2))
         (fs/remove-tree! root-a)
         (fs/remove-tree! root-b)))))
