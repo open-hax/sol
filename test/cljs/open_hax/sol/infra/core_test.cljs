@@ -19,7 +19,8 @@
 (deftest exported-seams-open-the-configured-clio-store-test
   ;; start! and solPlugin both resolve through this function; neither goes
   ;; through bootstrap!, so the store must be opened here.
-  (let [root (scratch)]
+  (let [root (scratch)
+        saved-stores [@session-store/default-store* @run-state/default-store* @core/auto-session-store*]]
     (try
       ;; Exercise the caller boundary: if register-app-routes! stopped resolving
       ;; through resolve-app-config, routes would receive no :clio/store.
@@ -35,7 +36,13 @@
         (let [resolved @captured]
           (is (some? (:clio/store resolved)) "Clio paths reach routes with an open store")
           (is (= [] (clio-store/events (:clio/store resolved))))))
-      (finally (fs/remove-tree! root)))))
+      (finally
+        ;; Registration installs process-wide defaults; restore all three
+        ;; before the Clio root they point at is deleted.
+        (session-store/set-default-store! (nth saved-stores 0))
+        (run-state/set-default-store! (nth saved-stores 1))
+        (reset! core/auto-session-store* (nth saved-stores 2))
+        (fs/remove-tree! root)))))
 
 (deftest already-open-store-is-not-reopened-test
   (let [root (scratch)]
@@ -63,10 +70,11 @@
   ;; throw "No default Sol session store configured" unless the shared
   ;; startup path installs the default stores.
   (let [root (scratch)
-        saved [@session-store/default-store* @run-state/default-store*]]
+        saved [@session-store/default-store* @run-state/default-store* @core/auto-session-store*]]
     (try
       (session-store/set-default-store! nil)
       (run-state/set-default-store! nil)
+      (reset! core/auto-session-store* nil)
       (let [resolved (register-with-stub-routes! (clio-config root))
             sessions @session-store/default-store*]
         (is (some? sessions) "session routes have a default store")
@@ -76,6 +84,7 @@
       (finally
         (session-store/set-default-store! (first saved))
         (run-state/set-default-store! (second saved))
+        (reset! core/auto-session-store* (nth saved 2))
         (fs/remove-tree! root)))))
 
 (deftest installed-default-stores-are-kept-test
