@@ -37,18 +37,22 @@
 (defn ensure-default-stores!
   "start! and solPlugin skip bootstrap!, so install the same default session
    and run stores here when none is configured yet. bootstrap!'s stores, and
-   any store installed explicitly, win. A session store this path created is
-   replaced when a retry after a failed registration resolves a different
-   :clio/store; once an app registered with it, a different :clio/store is
-   rejected before any shared state changes, so a running app's routes and
-   session events keep one ledger."
+   any store installed explicitly, win. A :clio/store that names the same
+   ledger as the auto-created session store's store is replaced by that store
+   in the returned config, so routes and session events share one store
+   object. A session store this path created is replaced when a retry after a
+   failed registration resolves a different ledger; once an app registered
+   with it, a different ledger is rejected before any shared state changes.
+   Returns the config to register with."
   [resolved-config]
   (let [base-dir (path/join (path/cwd) ".ημ" "sol")
         canonical (:clio/store resolved-config)
         current @session-store/default-store*
         {auto :store active? :active?} @auto-session-store*
         ours? (and (some? current) (identical? current auto))
-        stale? (and ours? (not (identical? canonical (:canonical-store current))))]
+        bound (when ours? (:canonical-store current))
+        same? (and ours? (clio-store/same-store? canonical bound))
+        stale? (and ours? (not same?))]
     (when (and stale? active?)
       (throw (ex-info "A Sol app is already registered with a different :clio/store; the process-wide session store cannot be rebound while it runs."
                       {:type :sol/incompatible-clio-store})))
@@ -59,7 +63,10 @@
         (session-store/set-default-store! store)))
     (when-not @run-state/default-store*
       (run-state/set-default-store!
-       (run-state/create-edn-run-state-store (path/join base-dir "runs"))))))
+       (run-state/create-edn-run-state-store (path/join base-dir "runs"))))
+    (if (and same? (some? bound))
+      (assoc resolved-config :clio/store bound)
+      resolved-config)))
 
 (defn- mark-auto-store-active! []
   (swap! auto-session-store*
@@ -70,8 +77,7 @@
 
 (defn register-app-routes!
   [runtime app config]
-  (let [resolved-config (resolve-app-config config)]
-    (ensure-default-stores! resolved-config)
+  (let [resolved-config (ensure-default-stores! (resolve-app-config config))]
     (reset! runtime-state/config* resolved-config)
     (reset! runtime-state/runtime* runtime)
     (let [result (app-routes/register-routes! runtime app resolved-config)]
