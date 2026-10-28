@@ -30,8 +30,8 @@
     (if (map? config) config (runtime-config/cfg))
     process/env-var)))
 
-(defonce ^{:doc "The session store this path installed, and whether an app
-   registered successfully with it: {:store s :active? bool}, or nil."}
+(defonce ^{:doc "The session store this path installed, and whether a route
+   registration has run with it: {:store s :active? bool}, or nil."}
   auto-session-store* (atom nil))
 
 (defn ensure-default-stores!
@@ -40,9 +40,9 @@
    any store installed explicitly, win. A :clio/store that names the same
    ledger as the auto-created session store's store is replaced by that store
    in the returned config, so routes and session events share one store
-   object. A session store this path created is replaced when a retry after a
-   failed registration resolves a different ledger; once an app registered
-   with it, a different ledger is rejected before any shared state changes.
+   object. Once any registration with a session store this path created has
+   run, even one that threw partway, a different ledger is rejected before
+   any shared state changes.
    Returns the config to register with."
   [resolved-config]
   (let [base-dir (path/join (path/cwd) ".ημ" "sol")
@@ -80,9 +80,14 @@
   (let [resolved-config (ensure-default-stores! (resolve-app-config config))]
     (reset! runtime-state/config* resolved-config)
     (reset! runtime-state/runtime* runtime)
-    (let [result (app-routes/register-routes! runtime app resolved-config)]
-      (mark-auto-store-active!)
-      result)))
+    ;; register-routes! attaches routes one at a time, so a throw can leave
+    ;; some Sol handlers on the caller's app. They already use the session
+    ;; store, so pin it on failure too: a later registration naming a
+    ;; different ledger is then rejected instead of rebinding it.
+    (try
+      (app-routes/register-routes! runtime app resolved-config)
+      (finally
+        (mark-auto-store-active!)))))
 
 (defn ^:async start!
   [runtime]
