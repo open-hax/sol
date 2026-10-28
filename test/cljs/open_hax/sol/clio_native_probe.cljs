@@ -5,7 +5,6 @@
             [open-hax.sol.infra.agent.episode-ledger :as episode]
             [open-hax.sol.infra.agent.session-store :as sessions]
             [open-hax.sol.extern.exclusive-fs :as exclusive-fs]
-            [open-hax.sol.extern.module-url :as module-url]
             ["node:url" :as node-url]
             [open-hax.sol.domain.node.path :as path]))
 
@@ -23,7 +22,9 @@
         (require-result! (= value (get (ex-data error) key)) "Session rejection lost original error facts")))))
 
 (defn ^:async probe!
-  [root]
+  "loaded-module is the path or file URL of the probe module the caller
+   imported; :module-anchor reports whether Sol's anchor resolves to it."
+  [root loaded-module]
   (let [options {:ledger-file (path/join root "epoch" "events.edn")
                  :schema-directory (path/join root "epoch" "schemas")}
         canonical-store (store/open! (assoc options :initialize? true))
@@ -85,17 +86,19 @@
       {:status :passed :events (count events) :identical-retry true
        :reopen-replay true :stream-sequences (mapv :event/seq events)
        :session-promises true :session-errors-preserved true
-       ;; The production anchor path: the module boundary (import.meta.url in
-       ;; ESM, __filename in the CommonJS test build), not stack frames.
-       :module-anchor (let [url (module-url/module-url)]
-                        (boolean (and url
-                                      (= (exclusive-fs/sol-module-anchor)
-                                         (exclusive-fs/realpath
-                                          (if (.startsWith (str url) "file://")
-                                            (node-url/fileURLToPath url)
-                                            url))))))})))
+       ;; The production anchor path (import.meta.url in ESM, __filename in
+       ;; the CommonJS test build) must name the probe module the caller
+       ;; actually loaded. Comparing against the registry value itself would
+       ;; pass for any preexisting anchor another Sol bundle left behind.
+       :module-anchor (boolean
+                       (when-let [expected (some-> loaded-module str)]
+                         (= (exclusive-fs/sol-module-anchor)
+                            (exclusive-fs/realpath
+                             (if (.startsWith expected "file://")
+                               (node-url/fileURLToPath expected)
+                               expected)))))})))
 
 (defn ^:async probe-edn!
   "JS export returns printable evidence; all assertions run through real stores."
-  [root]
-  (pr-str (await (probe! root))))
+  [root loaded-module]
+  (pr-str (await (probe! root loaded-module))))
