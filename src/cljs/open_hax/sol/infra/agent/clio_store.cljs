@@ -775,6 +775,18 @@
                         (not= requested-schema store-schema))))
       (throw (ex-info "Changing Clio filesystem paths requires a full restart" {})))))
 
+(defn same-store?
+  "True when two open store maps write the same ledger: the same object, or
+   the same ledger-file and schema-directory locations. Resolving the same
+   SOL_CLIO_* paths again opens a fresh map for that same history."
+  [a b]
+  (or (identical? a b)
+      (boolean
+       (and (map? a) (map? b)
+            (same-storage-path? (:ledger-file a) (:ledger-file b))
+            (same-storage-path? (or (:schema-directory a) (:schema/directory (:runtime a)))
+                                (or (:schema-directory b) (:schema/directory (:runtime b))))))))
+
 (defn ensure-configured!
   "Open the opt-in store for an exported startup seam (start!, solPlugin) that
    did not come through bootstrap!. An already-open store is kept only while

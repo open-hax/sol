@@ -71,19 +71,19 @@ shadow-cljs :server / :server-dev
 Use Node **22.20.0** and npm **10.9.3** (recorded in `package.json`'s Volta
 configuration). Install the standalone dependency graph with `npm ci`; the
 committed npm v3 lock is the install authority. Do not install from a sibling
-workspace or generate a second lock. pnpm command aliases remain available
-after that frozen install.
+workspace or generate a second lock. `npm ci` does not install pnpm, so run
+the declared scripts with `npm run` (or `npm test`).
 
 ```bash
-pnpm watch        # shadow-cljs watch server-dev → dist-dev/server.js
-pnpm start:dev    # node dist-dev/server.js
-pnpm build        # shadow-cljs compile server → dist/server.js
-pnpm start        # node dist/server.js
-pnpm test         # local shadow compiler + completed, nonempty CLJS result guard
-pnpm test:guard   # Node regressions for false-success and contract guards
-pnpm check:startup # temporary localhost health + SIGTERM; no daemon/service
-pnpm lint         # clj-kondo --lint src/cljs test/cljs   (alias: lint:kondo)
-pnpm typecheck    # shadow-cljs compile server
+npm run watch     # shadow-cljs watch server-dev → dist-dev/server.js
+npm run start:dev # node dist-dev/server.js
+npm run build     # shadow-cljs compile server → dist/server.js
+npm start         # node dist/server.js
+npm test          # local shadow compiler + completed, nonempty CLJS result guard
+npm run test:guard # Node regressions for false-success and contract guards
+npm run check:startup # temporary localhost health + SIGTERM; no daemon/service
+npm run lint      # clj-kondo --lint src/cljs test/cljs   (alias: lint:kondo)
+npm run typecheck # shadow-cljs compile server
 ```
 
 After a code change, follow the workspace CLJS construction order in

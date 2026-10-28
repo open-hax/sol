@@ -2,6 +2,9 @@
   "Minimal Sol core: exposes route and WebSocket registration helpers."
   (:require [open-hax.sol.infra.routes.app :as app-routes]
             [open-hax.sol.infra.agent.clio-store :as clio-store]
+            [open-hax.sol.infra.agent.run-state :as run-state]
+            [open-hax.sol.infra.agent.session-store :as session-store]
+            [open-hax.sol.domain.node.path :as path]
             [open-hax.sol.domain.realtime :as realtime]
             [open-hax.sol.infra.config :as runtime-config]
             [open-hax.sol.domain.models :as runtime-models]
@@ -27,12 +30,120 @@
     (if (map? config) config (runtime-config/cfg))
     process/env-var)))
 
+(defonce ^{:doc "The session store this path installed, and whether a route
+   registration has run with it: {:store s :active? bool}, or nil."}
+  auto-session-store* (atom nil))
+
+(defonce ^{:doc "The run-state store this path installed, and whether a route
+   registration has run with it: {:store s :active? bool}, or nil."}
+  auto-run-state-store* (atom nil))
+
+(defn ensure-default-stores!
+  "start! and solPlugin skip bootstrap!, so install the same default session
+   and run stores here when none is configured yet. bootstrap!'s stores, and
+   any store installed explicitly, win. A :clio/store that names the same
+   ledger as the auto-created session store's store is replaced by that store
+   in the returned config, together with that store's ledger-file and
+   schema-directory paths, so routes and session events share one store
+   object. Once any registration with a session store this path created has
+   run, even one that threw partway, a different ledger is rejected before
+   any shared state changes.
+   Returns the config to register with."
+  [resolved-config]
+  (let [base-dir (path/join (path/cwd) ".ημ" "sol")
+        canonical (:clio/store resolved-config)
+        current @session-store/default-store*
+        {auto :store active? :active?} @auto-session-store*
+        ours? (and (some? current) (identical? current auto))
+        bound (when ours? (:canonical-store current))
+        same? (and ours? (clio-store/same-store? canonical bound))
+        stale? (and ours? (not same?))]
+    (when (and stale? active?)
+      (throw (ex-info "A Sol app is already registered with a different :clio/store; the process-wide session store cannot be rebound while it runs."
+                      {:type :sol/incompatible-clio-store})))
+    (when (or (nil? current) stale?)
+      (let [store (session-store/create-edn-session-store
+                   (path/join base-dir "sessions") canonical)]
+        (reset! auto-session-store* {:store store :active? false})
+        (session-store/set-default-store! store)))
+    (when-not @run-state/default-store*
+      (let [store (run-state/create-edn-run-state-store (path/join base-dir "runs"))]
+        (reset! auto-run-state-store* {:store store :active? false})
+        (run-state/set-default-store! store)))
+    (if (and same? (some? bound))
+      ;; same-store? accepts relative, absolute and symlink aliases; carry
+      ;; the reused store's own path strings so a later resolve-app-config
+      ;; (which compares strings) keeps it instead of demanding a restart.
+      (assoc resolved-config
+             :clio/store bound
+             :clio/ledger-file (:ledger-file bound)
+             :clio/schema-directory (or (:schema-directory bound)
+                                        (:schema/directory (:runtime bound))
+                                        (:clio/schema-directory resolved-config)))
+      resolved-config)))
+
+(defn bootstrap-session-store!
+  "The session store bootstrap! should install. bootstrap is a public export,
+   so a host can call it after solPlugin registered routes that resolve the
+   default session store at operation time. While that auto-installed store
+   is active, the same ledger reuses it and a different ledger is rejected;
+   otherwise a new store is created as before. Installs nothing itself."
+  [base-dir resolved-config]
+  (let [canonical (:clio/store resolved-config)
+        current @session-store/default-store*
+        {auto :store active? :active?} @auto-session-store*
+        active-auto? (and active? (some? current) (identical? current auto))]
+    (cond
+      (and active-auto? (clio-store/same-store? canonical (:canonical-store current)))
+      current
+
+      active-auto?
+      (throw (ex-info "A Sol app is already registered with a different :clio/store; bootstrap cannot rebind the process-wide session store while it runs."
+                      {:type :sol/incompatible-clio-store}))
+
+      :else
+      (session-store/create-edn-session-store
+       (path/join base-dir "sessions") canonical))))
+
+(defn bootstrap-run-state-store!
+  "The run-state store bootstrap! should install. Run routes resolve the
+   default run store at operation time, so while a direct-start app
+   registered through register-app-routes! uses the run store this path
+   installed, bootstrap! keeps it even if the working directory changed.
+   Any other default run store (for example one left by an earlier bootstrap
+   or after HTTP shutdown) is not reused: a new store is created under
+   base-dir. Installs nothing itself."
+  [base-dir]
+  (let [current @run-state/default-store*
+        {auto :store active? :active?} @auto-run-state-store*]
+    (if (and active? (some? current) (identical? current auto))
+      current
+      (run-state/create-edn-run-state-store (path/join base-dir "runs")))))
+
+(defn- mark-active [state* default]
+  (swap! state*
+         (fn [{:keys [store] :as state}]
+           (if (and (some? store) (identical? store default))
+             (assoc state :active? true)
+             state))))
+
+(defn- mark-auto-store-active! []
+  (mark-active auto-session-store* @session-store/default-store*)
+  (mark-active auto-run-state-store* @run-state/default-store*))
+
 (defn register-app-routes!
   [runtime app config]
-  (let [resolved-config (resolve-app-config config)]
+  (let [resolved-config (ensure-default-stores! (resolve-app-config config))]
     (reset! runtime-state/config* resolved-config)
     (reset! runtime-state/runtime* runtime)
-    (app-routes/register-routes! runtime app resolved-config)))
+    ;; register-routes! attaches routes one at a time, so a throw can leave
+    ;; some Sol handlers on the caller's app. They already use the session
+    ;; store, so pin it on failure too: a later registration naming a
+    ;; different ledger is then rejected instead of rebinding it.
+    (try
+      (app-routes/register-routes! runtime app resolved-config)
+      (finally
+        (mark-auto-store-active!)))))
 
 (defn ^:async start!
   [runtime]
@@ -40,8 +151,8 @@
     (let [config (resolve-app-config nil)
           Fastify (js/require "fastify")
           app (Fastify #js {:logger #js {:stream (.-stderr js/process)}})]
-      (reset! runtime-state/config* config)
-      (reset! runtime-state/runtime* runtime)
+      ;; register-app-routes! writes config*/runtime* only after its store
+      ;; compatibility check, so a rejected start! leaves them unchanged.
       (register-app-routes! runtime app config)
       (register-ws-routes! runtime app)
       (await (.listen app #js {:host (:host config) :port (:port config)}))
