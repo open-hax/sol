@@ -115,6 +115,7 @@
 
 (defn- reset-stores! []
   (reset! core/auto-session-store* nil)
+  (reset! core/auto-run-state-store* nil)
   (session-store/set-default-store! nil)
   (run-state/set-default-store! nil))
 
@@ -278,6 +279,39 @@
         (reset! runtime-state/runtime* (nth saved 4))
         (fs/remove-tree! root-a)
         (fs/remove-tree! root-b)))))
+
+(deftest bootstrap-keeps-the-active-direct-start-run-store-test
+  ;; register-app-routes! installs a run store for start! and solPlugin, and
+  ;; run routes resolve the default run store at operation time. bootstrap!
+  ;; must keep that store while the direct-start app is registered, even if
+  ;; the working directory changed. A default run store that this path did
+  ;; not install (for example one left after an earlier bootstrap or HTTP
+  ;; shutdown) is not reused: bootstrap! gets a fresh store.
+  (let [root-a (scratch)
+        base-dir (scratch)
+        saved [@session-store/default-store* @run-state/default-store*
+               @core/auto-session-store* @core/auto-run-state-store*]]
+    (try
+      (reset-stores!)
+      (let [leftover (run-state/create-edn-run-state-store (path/join (scratch) "runs"))]
+        (run-state/set-default-store! leftover)
+        (let [fresh (core/bootstrap-run-state-store! base-dir)]
+          (is (some? fresh) "with no direct-start app bootstrap! gets a run store")
+          (is (not (identical? leftover fresh))
+              "a run store this path did not install is not reused")))
+      (reset-stores!)
+      (register-with-stub-routes! (clio-config root-a))
+      (let [runs @run-state/default-store*]
+        (is (some? runs) "the direct-start path installed a run store")
+        (is (identical? runs (core/bootstrap-run-state-store! base-dir))
+            "bootstrap! keeps the active direct-start app's run store"))
+      (finally
+        (session-store/set-default-store! (nth saved 0))
+        (run-state/set-default-store! (nth saved 1))
+        (reset! core/auto-session-store* (nth saved 2))
+        (reset! core/auto-run-state-store* (nth saved 3))
+        (fs/remove-tree! root-a)
+        (fs/remove-tree! base-dir)))))
 
 (deftest bootstrap-keeps-the-active-auto-session-store-test
   ;; bootstrap is a public export, so a host can call it after solPlugin
