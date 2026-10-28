@@ -68,6 +68,29 @@
       (assoc resolved-config :clio/store bound)
       resolved-config)))
 
+(defn bootstrap-session-store!
+  "The session store bootstrap! should install. bootstrap is a public export,
+   so a host can call it after solPlugin registered routes that resolve the
+   default session store at operation time. While that auto-installed store
+   is active, the same ledger reuses it and a different ledger is rejected;
+   otherwise a new store is created as before. Installs nothing itself."
+  [base-dir resolved-config]
+  (let [canonical (:clio/store resolved-config)
+        current @session-store/default-store*
+        {auto :store active? :active?} @auto-session-store*
+        active-auto? (and active? (some? current) (identical? current auto))]
+    (cond
+      (and active-auto? (clio-store/same-store? canonical (:canonical-store current)))
+      current
+
+      active-auto?
+      (throw (ex-info "A Sol app is already registered with a different :clio/store; bootstrap cannot rebind the process-wide session store while it runs."
+                      {:type :sol/incompatible-clio-store}))
+
+      :else
+      (session-store/create-edn-session-store
+       (path/join base-dir "sessions") canonical))))
+
 (defn- mark-auto-store-active! []
   (swap! auto-session-store*
          (fn [{:keys [store] :as state}]

@@ -95,8 +95,7 @@
                (contract-runtime-deps/inject-deps!
                 (runtime-models/enrich-config (runtime-config/cfg) process/env-var)))
           base-dir (path/join (path/cwd) ".ημ" "sol")
-          session-store (session-store/create-edn-session-store
-                         (path/join base-dir "sessions") (:clio/store cfg))
+          session-store (core/bootstrap-session-store! base-dir cfg)
           run-state-store (run-state/create-edn-run-state-store (path/join base-dir "runs"))]
       (session-store/set-default-store! session-store)
       (run-state/set-default-store! run-state-store)
