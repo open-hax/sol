@@ -245,3 +245,44 @@
         (reset! runtime-state/runtime* (nth saved 4))
         (fs/remove-tree! root-a)
         (fs/remove-tree! root-b)))))
+
+(deftest bootstrap-keeps-the-active-auto-session-store-test
+  ;; bootstrap is a public export, so a host can call it after solPlugin
+  ;; registered routes. Those routes resolve the default session store at
+  ;; operation time, so bootstrap! must not install a fresh store over the
+  ;; active auto-installed one: the same ledger reuses it, and a different
+  ;; ledger is rejected. With no active auto store, bootstrap! installs its
+  ;; own store as before.
+  (let [root-a (scratch)
+        root-b (scratch)
+        base-dir (scratch)
+        saved [@session-store/default-store* @run-state/default-store* @core/auto-session-store*]]
+    (try
+      (reset-stores!)
+      (let [fresh (core/bootstrap-session-store!
+                   base-dir (clio-store/configure! (clio-config root-a)))]
+        (is (some? fresh) "with no active auto store bootstrap! gets a new store")
+        (is (nil? @session-store/default-store*)
+            "choosing the bootstrap store does not install it"))
+      (reset-stores!)
+      (register-with-stub-routes! (clio-config root-a))
+      (let [sessions @session-store/default-store*
+            same-paths (clio-store/configure! (assoc (clio-config root-a) :clio/initialize? false))
+            reused (core/bootstrap-session-store! base-dir same-paths)
+            rejected (try (core/bootstrap-session-store!
+                           base-dir (clio-store/configure! (clio-config root-b)))
+                          nil
+                          (catch :default e e))]
+        (is (identical? sessions reused)
+            "bootstrap! with the same ledger reuses the active session store")
+        (is (= :sol/incompatible-clio-store (:type (ex-data rejected)))
+            "bootstrap! with a different ledger is rejected while an app runs")
+        (is (identical? sessions @session-store/default-store*)
+            "the running app's session store is kept"))
+      (finally
+        (session-store/set-default-store! (first saved))
+        (run-state/set-default-store! (second saved))
+        (reset! core/auto-session-store* (nth saved 2))
+        (fs/remove-tree! root-a)
+        (fs/remove-tree! root-b)
+        (fs/remove-tree! base-dir)))))
