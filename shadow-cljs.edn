@@ -102,7 +102,8 @@
   :clio-native
   {:target :esm
    :output-dir "target/clio-native"
-   :modules {:probe {:exports {:probe open-hax.sol.clio-native-probe/probe-edn!}}}
+   :modules {:probe {:prepend "globalThis[Symbol.for(\"open-hax.sol/module-url\")] ??= import.meta.url;\n"
+                     :exports {:probe open-hax.sol.clio-native-probe/probe-edn!}}}
    :js-options {:js-provider :import
                 :keep-as-import #{"node:fs" "node:crypto" "node:path"
                                   "node:process" "node:module"}}

@@ -85,11 +85,15 @@
       {:status :passed :events (count events) :identical-retry true
        :reopen-replay true :stream-sequences (mapv :event/seq events)
        :session-promises true :session-errors-preserved true
-       ;; The production anchor path: the module boundary, not stack frames.
+       ;; The production anchor path: the module boundary (import.meta.url in
+       ;; ESM, __filename in the CommonJS test build), not stack frames.
        :module-anchor (let [url (module-url/module-url)]
                         (boolean (and url
                                       (= (exclusive-fs/sol-module-anchor)
-                                         (exclusive-fs/realpath (node-url/fileURLToPath url))))))})))
+                                         (exclusive-fs/realpath
+                                          (if (.startsWith (str url) "file://")
+                                            (node-url/fileURLToPath url)
+                                            url))))))})))
 
 (defn ^:async probe-edn!
   "JS export returns printable evidence; all assertions run through real stores."

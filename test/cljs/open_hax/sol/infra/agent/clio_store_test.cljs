@@ -74,7 +74,8 @@
       (let [result (await (probe/probe! root))]
         (is (= {:status :passed :events 2 :identical-retry true
                 :reopen-replay true :stream-sequences [1 2]
-                :session-promises true :session-errors-preserved true} result)))
+                :session-promises true :session-errors-preserved true
+                :module-anchor true} result)))
       (finally (fs/remove-tree! root)))))
 
 (deftest ^:async actual-admission-and-session-seam-test
