@@ -118,22 +118,33 @@
   (session-store/set-default-store! nil)
   (run-state/set-default-store! nil))
 
-(deftest retry-after-failed-registration-follows-the-resolved-clio-store-test
-  ;; A retry after a failed register-app-routes! call must not keep a session
-  ;; store that this path created for a different resolved Clio store.
+(deftest failed-route-registration-pins-the-session-store-test
+  ;; register-routes! can attach some Sol routes to the caller's app and then
+  ;; throw (for example on a conflicting route in an existing Fastify app).
+  ;; Those handlers already use the auto-installed session store, so a retry
+  ;; naming a different Clio ledger must be rejected rather than rebinding
+  ;; the process-wide store under them. A retry with the same ledger works.
   (let [root-a (scratch)
         root-b (scratch)
         saved [@session-store/default-store* @run-state/default-store* @core/auto-session-store*]]
     (try
       (reset-stores!)
       (register-failing! (clio-config root-a))
-      (let [runs @run-state/default-store*
-            resolved (register-with-stub-routes! (clio-config root-b))
-            sessions @session-store/default-store*]
-        (is (identical? (:clio/store resolved) (:canonical-store sessions))
-            "the auto-installed session store follows the retried Clio store")
+      (let [sessions @session-store/default-store*
+            runs @run-state/default-store*
+            rejected (try (register-with-stub-routes! (clio-config root-b))
+                          nil
+                          (catch :default e e))]
+        (is (= :sol/incompatible-clio-store (:type (ex-data rejected)))
+            "a different ledger after a partial registration is rejected")
+        (is (identical? sessions @session-store/default-store*)
+            "the partially registered app's session store is kept")
         (is (identical? runs @run-state/default-store*)
-            "the run store has no Clio binding and is kept"))
+            "the run store has no Clio binding and is kept")
+        (let [again (register-with-stub-routes! (assoc (clio-config root-a) :clio/initialize? false))]
+          (is (identical? (:canonical-store sessions) (:clio/store again))
+              "a retry with the same ledger reuses the session store's Clio store")
+          (is (identical? sessions @session-store/default-store*))))
       (finally
         (session-store/set-default-store! (first saved))
         (run-state/set-default-store! (second saved))
