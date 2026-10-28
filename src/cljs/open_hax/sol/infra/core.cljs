@@ -39,7 +39,8 @@
    and run stores here when none is configured yet. bootstrap!'s stores, and
    any store installed explicitly, win. A :clio/store that names the same
    ledger as the auto-created session store's store is replaced by that store
-   in the returned config, so routes and session events share one store
+   in the returned config, together with that store's ledger-file and
+   schema-directory paths, so routes and session events share one store
    object. Once any registration with a session store this path created has
    run, even one that threw partway, a different ledger is rejected before
    any shared state changes.
@@ -65,7 +66,15 @@
       (run-state/set-default-store!
        (run-state/create-edn-run-state-store (path/join base-dir "runs"))))
     (if (and same? (some? bound))
-      (assoc resolved-config :clio/store bound)
+      ;; same-store? accepts relative, absolute and symlink aliases; carry
+      ;; the reused store's own path strings so a later resolve-app-config
+      ;; (which compares strings) keeps it instead of demanding a restart.
+      (assoc resolved-config
+             :clio/store bound
+             :clio/ledger-file (:ledger-file bound)
+             :clio/schema-directory (or (:schema-directory bound)
+                                        (:schema/directory (:runtime bound))
+                                        (:clio/schema-directory resolved-config)))
       resolved-config)))
 
 (defn bootstrap-session-store!
