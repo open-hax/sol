@@ -209,6 +209,39 @@
         (reset! core/auto-session-store* (nth saved 2))
         (fs/remove-tree! root)))))
 
+(deftest aliased-paths-re-registration-uses-the-active-store-paths-test
+  ;; A relative alias of the running app's SOL_CLIO_* paths names the same
+  ;; ledger, so the active store is reused. The returned config must then
+  ;; carry that store's own paths too: resolving it again (hot reload, a
+  ;; later start) compares path strings and would otherwise demand a restart.
+  (let [root (scratch)
+        saved [@session-store/default-store* @run-state/default-store* @core/auto-session-store*]]
+    (try
+      (reset-stores!)
+      (let [first-resolved (register-with-stub-routes! (clio-config root))
+            bound (:clio/store first-resolved)
+            alias (-> (clio-config root)
+                      (update :clio/ledger-file #(path/relative (path/cwd) %))
+                      (update :clio/schema-directory #(path/relative (path/cwd) %))
+                      (assoc :clio/initialize? false))
+            again (register-with-stub-routes! alias)]
+        (is (not= (:clio/ledger-file alias) (:ledger-file bound))
+            "the second registration spells the ledger path differently")
+        (is (identical? bound (:clio/store again))
+            "routes reuse the active Clio store for the aliased paths")
+        (is (= (:ledger-file bound) (:clio/ledger-file again))
+            "the returned config names the reused store's ledger file")
+        (is (= (:clio/schema-directory first-resolved) (:clio/schema-directory again))
+            "the returned config names the reused store's schema directory")
+        (is (= (:clio/ledger-file again)
+               (:clio/ledger-file (core/resolve-app-config again)))
+            "resolving the returned config again keeps the reused store"))
+      (finally
+        (session-store/set-default-store! (first saved))
+        (run-state/set-default-store! (second saved))
+        (reset! core/auto-session-store* (nth saved 2))
+        (fs/remove-tree! root)))))
+
 (deftest ^:async rejected-start-leaves-runtime-state-untouched-test
   ;; start! must not write config*/runtime* before register-app-routes! has
   ;; checked store compatibility; otherwise a rejected start! leaves config*
