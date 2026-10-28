@@ -4,6 +4,9 @@
             [open-hax.sol.infra.agent.clio-store :as store]
             [open-hax.sol.infra.agent.episode-ledger :as episode]
             [open-hax.sol.infra.agent.session-store :as sessions]
+            [open-hax.sol.extern.exclusive-fs :as exclusive-fs]
+            [open-hax.sol.extern.module-url :as module-url]
+            ["node:url" :as node-url]
             [open-hax.sol.domain.node.path :as path]))
 
 (defn- require-result!
@@ -81,7 +84,12 @@
                            "Rejected session call rewrote malformed ledger")))
       {:status :passed :events (count events) :identical-retry true
        :reopen-replay true :stream-sequences (mapv :event/seq events)
-       :session-promises true :session-errors-preserved true})))
+       :session-promises true :session-errors-preserved true
+       ;; The production anchor path: the module boundary, not stack frames.
+       :module-anchor (let [url (module-url/module-url)]
+                        (boolean (and url
+                                      (= (exclusive-fs/sol-module-anchor)
+                                         (exclusive-fs/realpath (node-url/fileURLToPath url))))))})))
 
 (defn ^:async probe-edn!
   "JS export returns printable evidence; all assertions run through real stores."
