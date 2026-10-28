@@ -96,7 +96,7 @@
                 (runtime-models/enrich-config (runtime-config/cfg) process/env-var)))
           base-dir (path/join (path/cwd) ".ημ" "sol")
           session-store (core/bootstrap-session-store! base-dir cfg)
-          run-state-store (run-state/create-edn-run-state-store (path/join base-dir "runs"))]
+          run-state-store (core/bootstrap-run-state-store! base-dir)]
       (session-store/set-default-store! session-store)
       (run-state/set-default-store! run-state-store)
       (let [runtime #js {:sessionStore session-store :runStateStore run-state-store}]
