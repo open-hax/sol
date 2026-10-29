@@ -108,7 +108,10 @@
                 :keep-as-import #{"node:fs" "node:crypto" "node:path"
                                   "node:process" "node:module"}}
    :compiler-options {:output-feature-set :es-next :optimizations :none
-                      :infer-externs false}}
+                      :infer-externs false}
+   ;; Release output keeps each bundle's code module-scoped (two-bundle check).
+   :release {:output-dir "target/clio-native-release"
+             :compiler-options {:optimizations :simple}}}
   :test
    {:target :node-test,
     :output-to "target/test/test.cjs",

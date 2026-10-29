@@ -57,6 +57,8 @@ jobs:
           npm test
           bash scripts/compile-clean.sh server dist/server.js npm run build
           bash scripts/compile-clean.sh clio-native target/clio-native/probe.js npm run build:clio-native
+          bash scripts/compile-clean.sh clio-native target/clio-native-release/probe.js npm run build:clio-native:release
+          npm run check:clio-native:two-bundles
       - name: Production dependency startup and SIGTERM
         shell: bash
         run: |

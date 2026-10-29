@@ -69,15 +69,33 @@ test('a signalled child fails even after passing counters', async () => {
 
 test('missing executable and timed out child fail', async () => {
   assert.notEqual((await runShadowTests({ command: '/sol-test-no-such-executable', args: [], stdout: quiet, stderr: quiet })).code, 0);
+  // The timed-out leader starts a descendant and reports its PID, so the
+  // timeout path must stop the whole compiler tree, not just the leader.
+  const leader = [
+    "const { spawn } = require('node:child_process');",
+    "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000);'], { stdio: 'ignore' });",
+    "process.stdout.write('CHILD ' + child.pid + '\\n');",
+    'setInterval(() => {}, 1000);',
+  ].join(' ');
+  let captured = '';
   const result = await runShadowTests({
     command: process.execPath,
-    args: ['-e', 'setInterval(() => {}, 1000);'],
-    timeoutMs: 100,
-    stdout: quiet,
+    args: ['-e', leader],
+    timeoutMs: 1_000,
+    stdout: (chunk) => { captured += chunk.toString(); },
     stderr: quiet,
   });
   assert.notEqual(result.code, 0);
   assert.equal(result.reason, 'timeout');
+  const descendant = Number(/CHILD (\d+)/.exec(captured)?.[1]);
+  assert.ok(descendant > 0, `timed-out leader did not report its descendant: ${captured}`);
+  let stopped = processStopped(descendant);
+  for (let i = 0; i < 50 && !stopped; i += 1) {
+    await new Promise((r) => setTimeout(r, 100));
+    stopped = processStopped(descendant);
+  }
+  if (!stopped) try { process.kill(descendant, 'SIGKILL'); } catch {}
+  assert.equal(stopped, true, `descendant ${descendant} survived the timeout`);
 });
 
 test('a descendant holding stdio open is reaped when the compiler exits', async () => {
