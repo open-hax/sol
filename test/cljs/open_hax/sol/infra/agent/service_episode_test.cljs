@@ -15,14 +15,14 @@
         result (await
                 (service/send-agent-turn!
                  {:runtime true}
-                 {:event-ledger-id-fn
+                 {:clio/correlation-id-fn
                   (sequential-id-fn
                    ["turn-1" "episode-1"
                     "event-1" "event-2" "event-3" "event-4"])
-                  :event-ledger-append!
+                  :clio/append!
                   (fn [envelope]
                     (swap! events* conj envelope)
-                    (js/Promise.resolve envelope))
+                    (js/Promise.resolve :appended))
                   :turn-executor!
                   (fn [_runtime _config request]
                     (js/Promise.resolve
@@ -36,8 +36,8 @@
                   :conversation-id "conversation-1"
                   :model "model-1"}))]
     (is (= "ok" (:answer result)))
-    (is (= ["sol.run.started"
-            "sol.turn.started"
-            "sol.turn.completed"
-            "sol.run.completed"]
+    (is (= [:sol.run/started
+            :sol.turn/started
+            :sol.turn/completed
+            :sol.run/completed]
            (mapv :event/type @events*)))))

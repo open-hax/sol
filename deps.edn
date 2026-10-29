@@ -1,8 +1,7 @@
 {;; Default classpath = the shadow-cljs build (shadow-cljs.edn uses :deps true).
- ;; katamorph + event-ledger are consumed from immutable git refs in the
+ ;; katamorph + Clio are consumed from immutable git refs in the
  ;; standalone open-hax repos, never from removed local packages/ copies.
- ;; Katamorph is tagged; event-ledger is pinned to the merged principal-binding
- ;; revision until the next package tag is cut.
+ ;; Generic event/schema/admission laws are consumed from immutable Clio source.
  ;; turn-processor + eta-mu are consumed as pinned git subdirectory deps:
  ;; the provider adapter wires their run-loop/stream-fn/tools into sol's
  ;; agent sessions. After E1.06 these will point to the new open-hax repos.
@@ -22,8 +21,8 @@
                                     :deps/root "packages/eta-mu"}
   io.github.open-hax/katamorph    {:git/tag "v0.2.0"
                                     :git/sha "305a5e49d834aca27566f739e8510f6b409fda78"}
-  io.github.open-hax/event-ledger {:git/url "https://github.com/open-hax/event-ledger.git"
-                                    :git/sha "ada7374b7f4e1c3b0ab4e6bbe996f10f06e9b93a"}}
+  io.github.open-hax/clio         {:git/url "https://github.com/open-hax/clio.git"
+                                    :git/sha "9b14cda67d76639ee33aa90eff3caf10dd120d7c"}}
 
  :aliases
  ;; Clojure-first mutation harness (mutation/knoxx/…) — mutates CLJS source

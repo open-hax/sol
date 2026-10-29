@@ -1,0 +1,162 @@
+{:proposal/id :sol/persistent-review-workers
+ :proposal/version 2
+ :proposal/status :proposed
+ :activation/enabled? false
+ :source/revision "72fdecca292859d92cba48b686ec6fe9c43a9133"
+ :parent/story "330aa63f-f697-5bd6-9fc0-3f19fbea2be4"
+ :parent/pr "https://github.com/open-hax/foresight/pull/122"
+ :authority {:admission :eta-mu :publication :eta-mu :execution :sol
+             :api :knoxx :identity :axxium :records :clio
+             :resources :katamorph :deployment :services}
+ :compatibility {:current-record-library :open-hax/clio
+                 :clio-migration :bounded-local-filesystem-slice
+                 :legacy-history :unmodified-not-migrated
+                 :durable-ack :upstream-gap
+                 :worker-host-qualified? false}
+ :dependencies
+ {open-hax/turn-processor {:git/sha "0ed56aa74a53a1d1e9c2e55ce95451817a7f3a90"
+                          :deps/root "packages/turn-processor"}
+  open-hax/eta-mu {:git/sha "0ed56aa74a53a1d1e9c2e55ce95451817a7f3a90"
+                  :deps/root "packages/eta-mu"}
+  io.github.open-hax/katamorph {:git/tag "v0.2.0"
+                               :git/sha "305a5e49d834aca27566f739e8510f6b409fda78"}
+  io.github.open-hax/clio {:git/sha "9b14cda67d76639ee33aa90eff3caf10dd120d7c"}}
+ :dispatch
+ {:supplier :eta-mu
+  :required-fields [:repository/id :pull-request/id :base/sha :head/sha
+                    :changed-paths :contract-revisions :artifact-catalog/digest
+                    :reviewer/id :model/id :prompt/revision :tools/profile
+                    :policy/revision :identity/binding]
+  :job-key :canonical-immutable-input-digest
+  :duplicate :return-existing-job
+  :same-id-different-input :reject
+  :ack-after :durable-canonical-acceptance
+  :branch-name-authority? false}
+ :execution
+ {:engine :existing-sol-agent-service-and-turn-processor
+  :reviewers [:mimo :kimi]
+  :global-model-concurrency 2
+  :per-reviewer-concurrency 1
+  :automatic-model-fallback? false
+  :automatic-billing-overage? false
+  :max-attempts 2
+  :retry-requires [:authorized-decision :remaining-budget :provider-reset-satisfied]
+  :sandbox {:candidate-process :separate-restricted-tool-executor
+            :provider-credential-owner :trusted-provider-broker
+            :forbidden-capabilities [:app-signing :deployment :github-publication]
+            :requires [:per-attempt-checkout :environment-allowlist :egress-policy
+                       :restricted-uid-and-filesystem :tool-policy]}}
+ :persistence
+ {:authority :canonical-clio-compatible-ledger
+  :required [:configured-appender :durable-ack :idempotent-event-id :replay-query
+             :single-writer-lease :monotonic-fence]
+  :projections :disposable-run-and-session-edn
+  :artifact-order [:write-bytes :sync-bytes :hash-bytes :accept-terminal-record]
+  :proposed-config "SOL_STATE_DIR"
+  :path-supplier :services-persistent-volume
+  :malformed-record :block-readiness-and-publication
+  :unavailable-appender :block-admission-and-publication}
+ :cancellation
+ {:order [:record-authorized-intent :abort-existing-turn :settle-or-kill-sandbox
+          :accept-fenced-cancelled-terminal]
+  :queued-job :never-start
+  :late-result :retain-evidence-without-eligibility
+  :client-disconnect :no-cancellation
+  :actions-waiter-timeout :no-cancellation
+  :head-supersession :cancel-and-reject-publication}
+ :restart
+ {:before-readiness [:replay-accepted-records :verify-artifact-digests :acquire-fence]
+  :queued-job :remain-queued
+  :expired-running-attempt :record-interrupted
+  :stream-resumption-claimed? false
+  :new-attempt :explicit-authorized-restart-from-immutable-input
+  :terminal-result :reuse-evidence-and-reconcile-delivery
+  :multi-host-failover :deferred}
+ :outbox
+ {:sol-purpose :deliver-result-to-eta-mu
+  :source :terminal-event-with-result-delivery-intent
+  :separate-dual-write-queue? false
+  :delivery :at-least-once-with-reconciliation
+  :idempotency-key [:job/digest :attempt/id :result/digest :delivery/kind]
+  :ack-after :durable-authorized-delivery-receipt
+  :github-publication-owner :eta-mu
+  :publisher-rechecks [:current-head :trusted-reviewer :complete-coverage
+                       :required-deterministic-checks :settled-findings]}
+ :review-policy
+ {:invited [:coderabbit :codex :mimo :kimi]
+  :minimum-qualifying-reviewers 1
+  :qualifying-verdicts [:approved :explicit-completed-pass]
+  :requires [:trusted-identity :exact-head :verified-complete-coverage]
+  :non-qualifying [:acknowledged :pending :skipped :rate-limited :stale :partial
+                   :cancelled :interrupted :missing-canonical-terminal]
+  :deterministic-evidence-roles :all-required
+  :planning-max-rounds 5
+  :duplicate-pending-request? false
+  :auto-merge? false}
+ :integration/points
+ [{:path "src/cljs/open_hax/sol/infra/agent/service.cljs"
+   :namespace "open-hax.sol.infra.agent.service" :anchor "IAgentService"
+   :gap :durable-review-job-delegate}
+  {:path "src/cljs/open_hax/sol/infra/agent/runner.cljs"
+   :namespace "open-hax.sol.infra.agent.runner" :anchor "spawn-direct!"
+   :gap :accepted-job-idempotency-and-attempt-binding}
+  {:path "src/cljs/open_hax/sol/infra/agent/provider/turn_processor.cljs"
+   :namespace "open-hax.sol.infra.agent.provider.turn-processor"
+   :anchor "IAgentProviderAdapter" :gap :exact-model-and-sandbox-tool-capability}
+  {:path "src/cljs/open_hax/sol/infra/agent/turn_session.cljs"
+   :namespace "open-hax.sol.infra.agent.turn-session" :anchor "abort!"
+   :gap :fenced-cancellation-acknowledgement}
+  {:path "src/cljs/open_hax/sol/infra/agent/run_state.cljs"
+   :namespace "open-hax.sol.infra.agent.run-state" :anchor "IRunStateStore"
+   :gap :projection-rebuild-not-canonical-journal}
+  {:path "src/cljs/open_hax/sol/infra/agent/session_store.cljs"
+   :namespace "open-hax.sol.infra.agent.session-store" :anchor "ISessionStore"
+   :gap :partial-persistence-methods}
+  {:path "src/cljs/open_hax/sol/infra/agent/clio_store.cljs"
+   :namespace "open-hax.sol.infra.agent.clio-store" :anchor "open!"
+   :gap :upstream-durable-ack-and-legacy-bridge}
+  {:path "src/cljs/open_hax/sol/law/lifecycle_catalog.cljc"
+   :namespace "open-hax.sol.law.lifecycle-catalog" :anchor "schema/event-schema"
+   :gap :owner-admitted-review-job-data}
+  {:path "src/cljs/open_hax/sol/infra/agent/episode_ledger.cljs"
+   :namespace "open-hax.sol.infra.agent.episode-ledger" :anchor "configured-appender"
+   :gap :require-durable-appender-and-owner-replay-capability}
+  {:path "src/cljs/open_hax/sol/infra/agent/episode_turn.cljs"
+   :namespace "open-hax.sol.infra.agent.episode-turn" :anchor "send-agent-turn!"
+   :gap :canonical-terminal-eligibility-and-delivery-intent}
+  {:path "src/cljs/open_hax/sol/shape/episode_event.cljs"
+   :namespace "open-hax.sol.shape.episode-event" :anchor "principal-binding"
+   :gap :owner-admitted-review-profile-correlation}
+  {:path "src/cljs/open_hax/sol/law/contract_kinds.cljs"
+   :namespace "open-hax.sol.law.contract-kinds" :anchor "class->kind"
+   :gap :upstream-katamorph-profile-registration}
+  {:path "src/cljs/open_hax/sol/domain/contracts/loader.cljs"
+   :namespace "open-hax.sol.domain.contracts.loader" :anchor "parse-contract-file-records!"
+   :gap :do-not-load-proposal-through-open-agent-fallback}
+  {:path "src/cljs/open_hax/sol/bootstrap.cljs"
+   :namespace "open-hax.sol.bootstrap" :anchor "bootstrap!"
+   :gap :recover-before-readiness-and-persistent-root}
+  {:path "src/cljs/open_hax/sol/infra/config.cljs"
+   :namespace "open-hax.sol.infra.config" :anchor "cfg"
+   :gap :explicit-reviewed-sol-state-config}
+  {:path "src/cljs/open_hax/sol/infra/graceful_shutdown.cljs"
+   :namespace "open-hax.sol.infra.graceful-shutdown" :anchor "begin-shutdown!"
+   :gap :fenced-stop-admission-and-durable-interruption}
+  {:path "src/cljs/open_hax/sol/infra/routes/app.cljs"
+   :namespace "open-hax.sol.infra.routes.app" :anchor "api-agent-session-abort!"
+   :gap :authenticated-knoxx-capabilities-and-real-abort-wiring}
+  {:path "src/cljs/open_hax/sol/infra/agent/runtime.cljs"
+   :namespace "open-hax.sol.infra.agent.runtime" :anchor "queue-agent-control!"
+   :gap :control-kind-abort-currently-follows-steer-path}]
+ :implementation/prerequisites
+ [:planning-review-settled :rheos-ready-admission :reproducible-node22-install
+  :katamorph-profile-admission :clio-durable-append-and-replay
+  :sandbox-credential-isolation :knoxx-authenticated-control-contract
+  :services-reviewed-slot-and-rollback]
+ :qualification/fixtures
+ [:duplicate-dispatch :mismatched-job-input :unsafe-revision :unauthorized-cancel
+  :stale-fence :partial-coverage :quota-reset :late-result-after-cancel
+  :crash-after-accept :crash-after-start :terminal-append-failure
+  :lost-delivery-response :duplicate-delivery :corrupt-record
+  :stale-head-publication :actions-waiter-ended :worker-restarted
+  :real-mimo-result :real-kimi-result]}

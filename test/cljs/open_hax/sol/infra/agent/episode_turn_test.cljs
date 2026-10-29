@@ -33,14 +33,14 @@
                          :conversation_id "conversation-1"
                          :model "model-1"}
         config {:sol-node-id "sol.node.local"
-                :event-ledger-id-fn
+                :clio/correlation-id-fn
                 (sequential-id-fn
                  ["turn-1" "episode-1"
                   "event-1" "event-2" "event-3" "event-4"])
-                :event-ledger-append!
+                :clio/append!
                 (fn [envelope]
                   (swap! events* conj envelope)
-                  (js/Promise.resolve envelope))
+                  (js/Promise.resolve :appended))
                 :turn-executor!
                 (fn [_runtime _config request]
                   (reset! executed-request* request)
@@ -51,31 +51,31 @@
                        turn-request))]
     (is (= expected-result actual))
     (is (= turn-request @executed-request*))
-    (is (= ["sol.run.started"
-            "sol.turn.started"
-            "sol.turn.completed"
-            "sol.run.completed"]
+    (is (= [:sol.run/started
+            :sol.turn/started
+            :sol.turn/completed
+            :sol.run/completed]
            (mapv :event/type @events*)))
-    (is (= [nil "event-1" "event-2" "event-3"]
-           (mapv :causal/parent @events*)))
-    (is (= #{"event-1"}
-           (set (map :causal/root @events*))))
+    (is (= (into [nil] (butlast (mapv :event/id @events*)))
+           (mapv #(first (:event/causes %)) @events*)))
+    (is (= #{(:event/id (first @events*))}
+           (set (map #(get-in % [:event/data :causal/root]) @events*))))
     (is (= "completed"
-           (get-in (last @events*) [:payload :status])))
+           (get-in (last @events*) [:event/data :payload :status])))
     (is (= "model-1"
-           (get-in (last @events*) [:payload :model])))))
+           (get-in (last @events*) [:event/data :payload :model])))))
 
 (deftest ^:async failed-turn-emits-failure-terminal-test
   (let [events* (atom [])
         turn-error (js/Error. "provider failed")
-        config {:event-ledger-id-fn
+        config {:clio/correlation-id-fn
                 (sequential-id-fn
                  ["turn-1" "episode-1"
                   "event-1" "event-2" "event-3" "event-4"])
-                :event-ledger-append!
+                :clio/append!
                 (fn [envelope]
                   (swap! events* conj envelope)
-                  (js/Promise.resolve envelope))
+                  (js/Promise.resolve :appended))
                 :turn-executor!
                 (fn [_runtime _config _request]
                   (js/Promise.reject turn-error))}]
@@ -84,20 +84,20 @@
       (is false "turn should reject")
       (catch :default actual-error
         (is (identical? turn-error actual-error))))
-    (is (= ["sol.run.started"
-            "sol.turn.started"
-            "sol.turn.failed"
-            "sol.run.failed"]
+    (is (= [:sol.run/started
+            :sol.turn/started
+            :sol.turn/failed
+            :sol.run/failed]
            (mapv :event/type @events*)))
     (is (= "provider failed"
-           (get-in (last @events*) [:payload :error])))
-    (is (= [nil "event-1" "event-2" "event-3"]
-           (mapv :causal/parent @events*)))))
+           (get-in (last @events*) [:event/data :payload :error])))
+    (is (= (into [nil] (butlast (mapv :event/id @events*)))
+           (mapv #(first (:event/causes %)) @events*)))))
 
 (deftest ^:async no-appender-preserves-local-runtime-test
   (let [executed?* (atom false)
         expected-result {:answer "local" :model "model-1"}
-        config {:event-ledger-id-fn
+        config {:clio/correlation-id-fn
                 (sequential-id-fn
                  ["turn-1" "episode-1"
                   "event-1" "event-2" "event-3" "event-4"])
@@ -111,9 +111,9 @@
 
 (deftest ^:async canonical-start-failure-prevents-false-execution-test
   (let [executed?* (atom false)
-        config {:event-ledger-id-fn
+        config {:clio/correlation-id-fn
                 (sequential-id-fn ["turn-1" "episode-1" "event-1"])
-                :event-ledger-append!
+                :clio/append!
                 (fn [_envelope]
                   (js/Promise.reject (js/Error. "ledger unavailable")))
                 :turn-executor!
@@ -132,18 +132,18 @@
         append-count* (atom 0)
         executed?* (atom false)
         turn-start-error (js/Error. "turn start rejected")
-        config {:event-ledger-id-fn
+        config {:clio/correlation-id-fn
                 (sequential-id-fn
                  ["turn-1" "episode-1"
-                  "event-1" "event-2" "event-3"])
-                :event-ledger-append!
+                  "event-1" "event-2" "event-3" "event-4"])
+                :clio/append!
                 (fn [envelope]
                   (let [append-number (swap! append-count* inc)]
                     (if (= 2 append-number)
                       (js/Promise.reject turn-start-error)
                       (do
                         (swap! accepted-events* conj envelope)
-                        (js/Promise.resolve envelope)))))
+                        (js/Promise.resolve :appended)))))
                 :turn-executor!
                 (fn [_runtime _config _request]
                   (reset! executed?* true)
@@ -154,25 +154,30 @@
       (catch :default actual-error
         (is (identical? turn-start-error actual-error))))
     (is (false? @executed?*))
-    (is (= ["sol.run.started" "sol.run.failed"]
+    ;; The compensating emit resolves the pending turn start first (it is
+    ;; admitted on retry), so the admitted turn is closed before the run.
+    (is (= [:sol.run/started :sol.turn/started :sol.turn/failed :sol.run/failed]
            (mapv :event/type @accepted-events*)))
-    (is (= [nil "event-1"]
-           (mapv :causal/parent @accepted-events*)))
     (is (= "turn start rejected"
-           (get-in (last @accepted-events*) [:payload :error])))))
+           (get-in (nth @accepted-events* 2) [:event/data :payload :error]))
+        "the admitted turn start is closed with the original error")
+    (is (= (into [nil] (butlast (mapv :event/id @accepted-events*)))
+           (mapv #(first (:event/causes %)) @accepted-events*)))
+    (is (= "turn start rejected"
+           (get-in (last @accepted-events*) [:event/data :payload :error])))))
 
 (deftest ^:async original-and-ledger-failures-are-both-observable-test
   (let [append-count* (atom 0)
-        config {:event-ledger-id-fn
+        config {:clio/correlation-id-fn
                 (sequential-id-fn
                  ["turn-1" "episode-1"
                   "event-1" "event-2" "event-3"])
-                :event-ledger-append!
-                (fn [envelope]
+                :clio/append!
+                (fn [_envelope]
                   (swap! append-count* inc)
                   (if (= 3 @append-count*)
                     (js/Promise.reject (js/Error. "failure event rejected"))
-                    (js/Promise.resolve envelope)))
+                    (js/Promise.resolve :appended)))
                 :turn-executor!
                 (fn [_runtime _config _request]
                   (js/Promise.reject (js/Error. "provider failed")))}]

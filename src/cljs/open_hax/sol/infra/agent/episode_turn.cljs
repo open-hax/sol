@@ -1,10 +1,11 @@
 (ns open-hax.sol.infra.agent.episode-turn
-  "Canonical event-ledger lifecycle wrapper for one Sol turn.
+  "Canonical Clio lifecycle wrapper for one Sol turn.
 
    The wrapped turn remains responsible for Sol's existing EDN run projection,
    session state, provider execution, and realtime broadcasts. This namespace
-   adds only the cross-runtime operational envelope owned by event-ledger."
+   adds only the cross-runtime operational envelope owned by Clio."
   (:require [open-hax.sol.extern.agent-turn-node :as xturn-node]
+            [open-hax.sol.extern.console :as xconsole]
             [open-hax.sol.infra.agent.episode-ledger :as episode-ledger]
             [open-hax.sol.infra.agent.turn :as turn]))
 
@@ -37,12 +38,12 @@
   [episode request]
   (await (episode-ledger/emit!
           episode
-          "sol.run.started"
+          :sol.run/started
           (lifecycle-payload request "running" nil)))
   (try
     (await (episode-ledger/emit!
             episode
-            "sol.turn.started"
+            :sol.turn/started
             (lifecycle-payload request "running" nil)))
     nil
     (catch :default turn-start-error
@@ -52,9 +53,12 @@
                      {:error (error-message turn-start-error)})
             run-failure-error
             (try
+              ;; Compensation resolves the pending turn start first, so a
+              ;; retry may admit it; close that turn before the run.
+              (await (episode-ledger/emit! episode :sol.turn/failed payload))
               (await (episode-ledger/emit!
                       episode
-                      "sol.run.failed"
+                      :sol.run/failed
                       payload))
               nil
               (catch :default error
@@ -75,8 +79,8 @@
                  "failed"
                  {:error (error-message error)})]
     (try
-      (await (episode-ledger/emit! episode "sol.turn.failed" payload))
-      (await (episode-ledger/emit! episode "sol.run.failed" payload))
+      (await (episode-ledger/emit! episode :sol.turn/failed payload))
+      (await (episode-ledger/emit! episode :sol.run/failed payload))
       nil
       (catch :default ledger-error
         ledger-error))))
@@ -107,38 +111,36 @@
 
 (defn- ^:async report-persistence-failure!
   "Report a canonical terminal append failure without rewriting successful local
-   execution as a failed run. Hosts may inject `:event-ledger-report-error!`;
+   execution as a failed run. Hosts may inject `:clio/report-error!`;
    the default is a structured console error. Reporter failure is itself logged
    but never replaces the already-produced turn result."
   [config request event-type error]
   (let [failure (persistence-failure request event-type error)]
     (try
-      (if-let [report! (:event-ledger-report-error! config)]
+      (if-let [report! (:clio/report-error! config)]
         (await (report! failure))
-        (.error js/console
-                "[sol-event-ledger] canonical terminal persistence failed"
-                failure))
+        (xconsole/error! "[sol-clio] canonical terminal persistence failed"
+                         failure))
       (catch :default report-error
-        (.error js/console
-                "[sol-event-ledger] persistence failure reporter failed"
-                (assoc failure
-                       :report/error (error-message report-error)))))
+        (xconsole/error! "[sol-clio] persistence failure reporter failed"
+                         (assoc failure
+                                :report/error (error-message report-error)))))
     failure))
 
 (defn- ^:async emit-completion-lifecycle!
   [config episode request completed]
   (try
-    (await (episode-ledger/emit! episode "sol.turn.completed" completed))
+    (await (episode-ledger/emit! episode :sol.turn/completed completed))
     (try
-      (await (episode-ledger/emit! episode "sol.run.completed" completed))
+      (await (episode-ledger/emit! episode :sol.run/completed completed))
       true
       (catch :default error
         (await (report-persistence-failure!
-                config request "sol.run.completed" error))
+                config request :sol.run/completed error))
         false))
     (catch :default error
       (await (report-persistence-failure!
-              config request "sol.turn.completed" error))
+              config request :sol.turn/completed error))
       false)))
 
 (defn ^:async send-agent-turn!
@@ -152,7 +154,7 @@
    failure events. Once execution succeeds, terminal canonical append failures
    are reported separately and the produced result is returned so Sol's local
    EDN/realtime projections stay truthful. `:turn-executor!` and
-   `:event-ledger-report-error!` are optional infra injections used by
+   `:clio/report-error!` are optional infra injections used by
    conformance tests and alternate Sol hosts."
   [runtime config request]
   (let [request (normalized-request request)

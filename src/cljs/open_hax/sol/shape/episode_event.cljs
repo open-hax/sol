@@ -1,12 +1,7 @@
 (ns open-hax.sol.shape.episode-event
-  "Pure Sol projection onto the standalone event-ledger envelope.
-
-   This namespace shapes references only. Axxium remains the authority for live
-   principals; Katamorph remains the authority for actor/agent resources;
-   event-ledger remains the authority for envelope validation and append
-   semantics."
-  (:require [clojure.string :as str]
-            [open-hax.event-ledger :as event-ledger]))
+  "Sol lifecycle facts carried by Clio. Supplied Axxium principal and Katamorph
+   resource references are correlation data, not locally invented authority."
+  (:require [clojure.string :as str]))
 
 (def principal-kinds
   #{"human" "agent" "service" "automation"})
@@ -93,7 +88,7 @@
              (nonblank-string (:contract-revision agent-spec))))))
 
 (defn principal-binding
-  "Build the event-ledger PrincipalBindingV1 only from supplied Axxium identity.
+  "Preserve the supplied Axxium identity binding and resource correlation.
 
    Accepted input includes Axxium's canonical RuntimePrincipalBinding map,
    a nested `:principal/binding`, Axxium `:auth/*` identity keys accompanied by
@@ -183,35 +178,20 @@
       (assoc :contracts [(:resource/id contract-ref)]
              :contract/refs [contract-ref]))))
 
-(defn envelope
-  "Build and validate one canonical event-ledger envelope.
-
-   `parent-id` is nil for the first event. The caller owns sequencing and only
-   advances the parent after successful append/acceptance."
-  [episode event-id event-time parent-id event-type payload]
-  (let [payload (cond-> (or payload {})
-                  (:conversation/id episode)
-                  (assoc :conversation/id (:conversation/id episode)))
-        candidate (cond->
-                   {:envelope/version 1
-                    :event/id event-id
-                    :event/type event-type
-                    :event/time event-time
-                    :event/from (:event/from episode)
-                    :causal/root (:causal/root episode)
-                    :session/id (:session/id episode)
-                    :turn/id (:turn/id episode)
-                    :run/id (:run/id episode)
-                    :episode/id (:episode/id episode)
-                    :delivery/mode "stream"
-                    :payload payload}
-                    parent-id (assoc :causal/parent parent-id)
-                    (:contracts episode) (assoc :contracts (:contracts episode))
-                    (:contract/refs episode) (assoc :contract/refs
-                                                    (:contract/refs episode)))
-        validation (event-ledger/validate-envelope candidate)]
-    (when-not (:valid validation)
-      (throw (ex-info "Sol produced an invalid event-ledger envelope"
-                      {:event/type event-type
-                       :errors (:errors validation)})))
-    candidate))
+(defn event-facts
+  "Project episode correlation and payload into Clio domain/stream facts.
+   Clio constructs and validates the generic envelope."
+  [episode sequence parent-id payload]
+  {:event/stream (:episode/id episode)
+   :event/seq sequence
+   :event/causes (if parent-id [parent-id] [])
+   :event/actor (get-in episode [:event/from :actor-id])
+   :event/subject (:run/id episode)
+   :event/data
+   (cond-> (assoc (dissoc episode :causal/root)
+                  :delivery/mode "stream"
+                  :payload (cond-> (or payload {})
+                             (:conversation/id episode)
+                             (assoc :conversation/id (:conversation/id episode))))
+     (:causal/root episode) (assoc :causal/root (:causal/root episode))
+     parent-id (assoc :causal/parent parent-id))})

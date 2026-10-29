@@ -44,7 +44,8 @@ matched by the `:test` build's `open-hax\.sol\..*-test$` regex.
 ## Build targets
 
 Defined in `shadow-cljs.edn` (nREPL `4501`, dev HTTP `9633`). Source-paths
-include sibling packages `../katamorph/src/cljs` and `../event-ledger/src`. All
+come from `deps.edn` via `:deps true`, including immutable Katamorph,
+Clio and eta-mu subdirectory Git dependencies. All
 runtime builds are `:target :esm` with `:js-provider :import`; Node and npm
 modules (`node:*`, `fastify`, `ws`, `typebox`, `@modelcontextprotocol/sdk`)
 stay runtime imports via `:keep-as-import`.
@@ -67,16 +68,22 @@ shadow-cljs :server / :server-dev
 
 ## Development and test commands
 
-From `packages/sol/` (pnpm; this is a workspace member):
+Use Node **22.20.0** and npm **10.9.3** (recorded in `package.json`'s Volta
+configuration). Install the standalone dependency graph with `npm ci`; the
+committed npm v3 lock is the install authority. Do not install from a sibling
+workspace or generate a second lock. `npm ci` does not install pnpm, so run
+the declared scripts with `npm run` (or `npm test`).
 
 ```bash
-pnpm watch        # shadow-cljs watch server-dev → dist-dev/server.js
-pnpm start:dev    # node dist-dev/server.js
-pnpm build        # shadow-cljs compile server → dist/server.js
-pnpm start        # node dist/server.js
-pnpm test         # shadow-cljs compile test (autoruns target/test/test.cjs)
-pnpm lint         # clj-kondo --lint src/cljs test/cljs   (alias: lint:kondo)
-pnpm typecheck    # shadow-cljs compile server
+npm run watch     # shadow-cljs watch server-dev → dist-dev/server.js
+npm run start:dev # node dist-dev/server.js
+npm run build     # shadow-cljs compile server → dist/server.js
+npm start         # node dist/server.js
+npm test          # local shadow compiler + completed, nonempty CLJS result guard
+npm run test:guard # Node regressions for false-success and contract guards
+npm run check:startup # temporary localhost health + SIGTERM; no daemon/service
+npm run lint      # clj-kondo --lint src/cljs test/cljs   (alias: lint:kondo)
+npm run typecheck # shadow-cljs compile server
 ```
 
 After a code change, follow the workspace CLJS construction order in
@@ -84,12 +91,65 @@ After a code change, follow the workspace CLJS construction order in
 broken, so inspect compiler/test output and, for runtime changes, also compile
 `server` to catch errors the `test` build does not.
 
+`npm test` invokes the installed local shadow wrapper. Missing modules/counters,
+empty suites, any failing counters, child errors/signals, compiler warnings and
+the three-minute compiler timeout fail the command. `check:startup` uses an
+isolated directory, an empty contract root, an ephemeral localhost port and an
+environment without provider/signing credentials. It requires Sol's `/health`
+identity and exit 0 after SIGTERM, then removes its temporary state. To verify
+production imports, pass a built bundle installed with `npm ci --omit=dev`:
+`node scripts/check-startup.mjs /absolute/path/to/production/dist/server.js`.
+The `Node 22 runtime` CI job exercises that production-only boundary.
+
+The unchanged Git dependencies are public. CI resolves their pinned HTTPS
+revisions with credential helpers and prompts disabled; no dependency secret
+is required. A local Git cache does not qualify fresh hosted dependency access.
+The merged Node22 prerequisite qualified the predecessor dependency at that
+revision. This local follow-up consumes immutable Clio `9b14cda67d76639ee33aa90eff3caf10dd120d7c`
+through its actual schema, event construction, filesystem admission and complete
+replay APIs. See the [bounded cutover contract](docs/design/sol-clio-cutover.md).
+It does not migrate old records or qualify persistent hosted workers.
+
+Canonical filesystem events require explicit `SOL_CLIO_LEDGER_FILE` and
+`SOL_CLIO_SCHEMA_DIR`. With `SOL_CLIO_INITIALIZE=true`, a fresh storage epoch
+is initialized. A committed Sol epoch at the same paths is reopened. An
+interrupted Sol initialization is resumed or rolled back. Existing paths are
+not checked for Sol ownership: any complete, valid Clio ledger and schema
+directory there is reopened, so operators must verify that the configured paths
+belong to the intended Sol epoch. With no configuration, local turn execution still
+validates Clio lifecycle data but persists no canonical history. Unsupported
+Mongo/legacy appender configuration is refused; no transport is converted
+implicitly. Existing session/run EDN projections retain their current paths.
+
 PM2 dev stack (shadow watch + nbb launcher that waits for `dist-dev/server.js`):
 
 ```bash
 pm2 start ecosystem.config.cjs   # sol-shadow + sol-backend
 pm2 logs sol
 ```
+
+### Persistent review worker planning
+
+See [the phase-one design](docs/design/persistent-review-workers.md),
+[machine-readable proposal](docs/design/persistent-review-workers.edn) and
+[dependency/build evidence](docs/design/sol-build-evidence.md). The existing
+run/session files are useful projections; they do not establish a durable review
+queue, restart recovery, reliable cancellation or a publication outbox.
+
+The proposal is linked to [Foresight PR #122](https://github.com/open-hax/foresight/pull/122)
+and story `330aa63f-f697-5bd6-9fc0-3f19fbea2be4`. It is deliberately outside
+`contracts/`: Katamorph has not admitted a review-job resource kind. No service
+is activated by these files.
+
+```bash
+bb scripts/check-review-worker-plan.clj  # proposal structure, pins, source links
+bb scripts/check_review_worker_plan_test.clj  # CLI omission/extra-entry regressions
+```
+
+This check does not validate Rheos, canonical Katamorph resources, actual worker
+execution or a deployment. The build evidence preserves the original npm
+lockfile mismatch and false-green test autorun, followed by the admitted Node
+22 prerequisite's actual results.
 
 ## Route surface
 

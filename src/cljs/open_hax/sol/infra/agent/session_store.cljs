@@ -1,24 +1,26 @@
 (ns open-hax.sol.infra.agent.session-store
   "EDN-backed session store for Sol.
 
-   Stores append-only event ledgers under .ημ/sol/sessions/ledgers/<id>.edn
-   and mutable session projections under .ημ/sol/sessions/state/<id>.edn."
+   Mutable session projections remain local. Canonical event append/read
+   requires an explicitly supplied Clio filesystem store; old ledgers stay untouched."
   (:require [cljs.reader :as reader]
             [clojure.string :as str]
             [open-hax.sol.domain.node.fs :as fs]
             [open-hax.sol.domain.node.path :as path]
             [open-hax.sol.domain.time :as time]
             [open-hax.sol.shape.session-persistence :as persistence]
-            [open-hax.event-ledger.schema :as event-schema])
+            [open-hax.sol.infra.agent.clio-store :as clio-store])
 )
 
 (defprotocol ISessionStore
   (get-session [store session-id])
   (save-session! [store session-id session])
-  (append-event! [store session-id event])
+  (append-event! [store session-id event]
+    "Resolves true on admission; rejects session mismatch or Clio errors.")
   (record-run! [store session-id run-id status])
   (get-session-runs [store session-id])
-  (get-events [store session-id])
+  (get-events [store session-id]
+    "Resolves canonical session events; rejects Clio read errors.")
   (list-sessions [store]))
 
 (defn- base-dir
@@ -29,20 +31,12 @@
   [store session-id]
   (path/join (base-dir store) "state" (str session-id ".edn")))
 
-(defn- ledger-path
-  [store session-id]
-  (path/join (base-dir store) "ledgers" (str session-id ".edn")))
-
 (defn- safe-read-edn
   [text]
   (try
     (when (string? text)
       (reader/read-string text))
     (catch :default _ nil)))
-
-(defn- pr-str-line
-  [value]
-  (str (pr-str value) "\n"))
 
 (defn- write-state!
   [store session-id session]
@@ -55,24 +49,6 @@
     (when (fs/exists? p)
       (some-> (fs/read-file-sync p)
               safe-read-edn))))
-
-(defn- read-ledger
-  [store session-id]
-  (let [p (ledger-path store session-id)]
-    (if (fs/exists? p)
-      (let [text (fs/read-file-sync p)]
-        (->> (str/split-lines (or text ""))
-             (map safe-read-edn)
-             (remove nil?)
-             vec))
-      [])))
-
-(defn- append-ledger!
-  [store session-id event]
-  (let [p (ledger-path store session-id)
-        line (pr-str-line event)
-        existing (or (when (fs/exists? p) (fs/read-file-sync p)) "")]
-    (fs/write-file-ensure-dir! p (str existing line))))
 
 (defn- all-state-files
   [store]
@@ -91,7 +67,7 @@
             (when (= run-id (:run_id state)) state)))
         (all-state-files store)))
 
-(defrecord EdnSessionStore [base-dir]
+(defrecord EdnSessionStore [base-dir canonical-store]
   ISessionStore
   (get-session [_ session-id]
     (js/Promise.resolve (read-state {:base-dir base-dir} session-id)))
@@ -101,16 +77,15 @@
     (js/Promise.resolve session))
 
   (append-event! [_ session-id event]
-    (let [validation (event-schema/validate-envelope event)]
-      (if (:valid validation)
-        (let [store {:base-dir base-dir}
-              stamped (assoc event :event/time (or (:event/time event)
-                                                   (time/now-iso)))]
-          (append-ledger! store session-id stamped)
-          (js/Promise.resolve true))
-        (js/Promise.reject (ex-info "Invalid event envelope"
-                                    {:session-id session-id
-                                     :errors (:errors validation)})))))
+    (js/Promise.
+     (fn [resolve reject]
+       (try
+         (when-not (= session-id (get-in event [:event/data :session/id]))
+           (throw (ex-info "Clio event belongs to another Sol session"
+                           {:session-id session-id})))
+         (clio-store/append! canonical-store event)
+         (resolve true)
+         (catch :default error (reject error))))))
 
   (record-run! [_ session-id run-id _status]
     (let [store {:base-dir base-dir}
@@ -129,7 +104,12 @@
       (js/Promise.resolve (vec (:runs state)))))
 
   (get-events [_ session-id]
-    (js/Promise.resolve (read-ledger {:base-dir base-dir} session-id)))
+    (js/Promise.
+     (fn [resolve reject]
+       (try
+         (resolve (filterv #(= session-id (get-in % [:event/data :session/id]))
+                           (clio-store/events canonical-store)))
+         (catch :default error (reject error))))))
 
   (list-sessions [_]
     (js/Promise.resolve (all-state-files {:base-dir base-dir})))
@@ -170,7 +150,9 @@
   ([]
    (create-edn-session-store (path/join (path/cwd) ".ημ" "sol" "sessions")))
   ([base-dir]
-   (->EdnSessionStore base-dir)))
+   (create-edn-session-store base-dir nil))
+  ([base-dir canonical-store]
+   (->EdnSessionStore base-dir canonical-store)))
 
 (defn set-default-store!
   [store]
