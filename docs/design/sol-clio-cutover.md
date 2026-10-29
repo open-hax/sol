@@ -51,7 +51,7 @@ exact Node 22.20.0/npm 10.9.3 production install qualification below.
 | --- | --- |
 | `SOL_CLIO_LEDGER_FILE` | Explicit new-epoch ledger file; no default path conversion. |
 | `SOL_CLIO_SCHEMA_DIR` | Explicit catalog-history directory for that epoch. |
-| `SOL_CLIO_INITIALIZE=true` | A fresh storage epoch (both paths new) is initialized. A committed Sol epoch at the same paths is reopened. An interrupted Sol initialization is resumed or rolled back under the init lock. Unrelated existing paths are refused. |
+| `SOL_CLIO_INITIALIZE=true` | A fresh storage epoch (both paths new) is initialized. A committed Sol epoch at the same paths is reopened. An interrupted Sol initialization is resumed or rolled back under the init lock. Existing paths are not checked for Sol ownership: any complete, valid Clio ledger and schema directory is reopened, so operators must verify that the configured paths belong to the intended Sol epoch. |
 | Ordinary reopen (flag unset) | Ledger and schema history must already exist. An interrupted Sol initialization is first recovered under the init lock. Complete canonical history is verified before HTTP readiness. |
 
 Example for an operator-provisioned fresh epoch, not a deployment instruction:

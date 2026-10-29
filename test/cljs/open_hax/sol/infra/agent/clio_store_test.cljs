@@ -71,10 +71,22 @@
 (deftest ^:async actual-lost-ack-and-reopen-test
   (let [root (scratch)]
     (try
-      (let [result (await (probe/probe! root))]
+      ;; The loaded test bundle is the entry script node runs (autorun), an
+      ;; independent source from the module-URL registry the anchor reads.
+      (let [result (await (probe/probe! root (aget (.-argv js/process) 1)))]
         (is (= {:status :passed :events 2 :identical-retry true
                 :reopen-replay true :stream-sequences [1 2]
-                :session-promises true :session-errors-preserved true} result)))
+                :session-promises true :session-errors-preserved true
+                :module-anchor true} result)))
+      (finally (fs/remove-tree! root)))))
+
+(deftest ^:async probe-module-anchor-detects-a-foreign-anchor-test
+  ;; A preexisting anchor that is not the loaded probe module must not pass.
+  (let [root (scratch)]
+    (try
+      (let [result (await (probe/probe! root (path/resolve "package.json")))]
+        (is (false? (:module-anchor result))
+            "anchor compared against a file other than the loaded probe bundle"))
       (finally (fs/remove-tree! root)))))
 
 (deftest ^:async actual-admission-and-session-seam-test

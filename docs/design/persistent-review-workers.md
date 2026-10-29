@@ -150,7 +150,8 @@ existing composition optional. Sol reports evidence; eta-mu applies the policy.
 ## Implementation order and qualification fixtures
 
 1. Settle this planning PR and root PR #122; use Rheos to admit the parent story
-   to ready. Restore the declared npm lockfile/toolchain so real Sol tests run.
+   to ready. Run the existing checks (`npm ci`, `npm run test:guard`,
+   `npm run lint`, `npm test`) on the pinned Node/npm toolchain.
 2. Admit job/completion/cancel/outbox profiles and durable idempotent append/replay
    requirements in Katamorph and Clio. Pin accepted compatible revisions in Sol.
 3. Add laws/shapes before adapters, with red fixtures for duplicate/mismatched

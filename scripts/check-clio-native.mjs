@@ -16,13 +16,16 @@ try {
   if (process.platform === 'linux') {
     assert.equal(await nativeMapped(), false, 'native lock binding loaded at import');
   }
-  const evidence = await probe(scratch);
+  // The anchor must match the bundle this script imported, not a value
+  // re-derived from the shared module-URL registry.
+  const evidence = await probe(scratch, bundle);
   assert.equal(await nativeMapped(), true, 'first lock did not load the native binding');
   assert.match(evidence, /:status :passed/);
   assert.match(evidence, /:events 2/);
   assert.match(evidence, /:identical-retry true/);
   assert.match(evidence, /:reopen-replay true/);
   assert.match(evidence, /:stream-sequences \[1 2\]/);
+  assert.match(evidence, /:module-anchor true/, 'probe bundle did not record its module URL');
   if (!process.env.SOL_CLIO_NATIVE_OUT_OF_TREE) {
     // Re-run from a cwd with no node_modules: the binding must still resolve
     // from Sol's install, not the caller's directory.
