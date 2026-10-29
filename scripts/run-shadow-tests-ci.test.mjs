@@ -81,7 +81,9 @@ test('missing executable and timed out child fail', async () => {
   const result = await runShadowTests({
     command: process.execPath,
     args: ['-e', leader],
-    timeoutMs: 1_000,
+    // Long enough for a loaded worker to start the leader and report its
+    // descendant before the timeout path runs.
+    timeoutMs: 5_000,
     stdout: (chunk) => { captured += chunk.toString(); },
     stderr: quiet,
   });
@@ -156,9 +158,12 @@ function processStopped(pid) {
     const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
     return stat.slice(stat.lastIndexOf(')') + 2).startsWith('Z');
   } catch (error) {
-    // ENOENT means the pid exited between the two checks. Any other read
-    // failure (procfs hidden or restricted) proves nothing, so keep polling.
-    return error.code === 'ENOENT';
+    // A missing procfs entry is not proof of exit (procfs may be unmounted),
+    // so on ENOENT repeat signal 0 and require ESRCH. Any other read failure
+    // proves nothing, so keep polling.
+    if (error.code !== 'ENOENT') return false;
+    try { process.kill(pid, 0); } catch (again) { return again.code === 'ESRCH'; }
+    return false;
   }
 }
 

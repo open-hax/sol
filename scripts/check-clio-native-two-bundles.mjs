@@ -9,11 +9,13 @@ import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const bundle = resolve(process.argv[2] ?? 'target/clio-native-release/probe.js');
-// The copies stay inside Sol's tree so both resolve Sol's node_modules.
-const root = resolve('target/clio-native-two-bundles');
+// The copies stay inside Sol's tree so both resolve Sol's node_modules. Each
+// check gets its own directory, so the supplied bundle and concurrent checks
+// are never removed.
+await mkdir(resolve('target'), { recursive: true });
+const root = await mkdtemp(resolve('target/clio-native-two-bundles-'));
 const scratch = await mkdtemp(join(tmpdir(), 'sol-clio-two-bundles-'));
 try {
-  await rm(root, { recursive: true, force: true });
   const copies = [];
   for (const name of ['first', 'second']) {
     await mkdir(join(root, name), { recursive: true });
