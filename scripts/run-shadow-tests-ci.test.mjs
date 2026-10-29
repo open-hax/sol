@@ -73,7 +73,7 @@ test('missing executable and timed out child fail', async () => {
   // timeout path must stop the whole compiler tree, not just the leader.
   const leader = [
     "const { spawn } = require('node:child_process');",
-    "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000);'], { stdio: 'ignore' });",
+    "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000);'], { stdio: 'ignore', detached: process.platform === 'win32' });",
     "process.stdout.write('CHILD ' + child.pid + '\\n');",
     'setInterval(() => {}, 1000);',
   ].join(' ');
@@ -148,7 +148,9 @@ test('a pipe holder outside the reaped tree fails instead of hanging', {
 // adopted children, and signal 0 still succeeds for a zombie. Treat that
 // state as stopped on Linux; elsewhere fall back to signal 0 alone.
 function processStopped(pid) {
-  try { process.kill(pid, 0); } catch { return true; }
+  // Only ESRCH proves the pid is gone; EPERM means it exists under another
+  // owner, so keep polling.
+  try { process.kill(pid, 0); } catch (error) { if (error.code === 'ESRCH') return true; }
   if (process.platform !== 'linux') return false;
   try {
     const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');

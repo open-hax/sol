@@ -11,9 +11,11 @@
    Release output shares one module scope with the prepend, so each bundle
    reads its own const and two imported Sol bundles keep separate anchors.
    Unoptimized output loads every namespace as a separate module that cannot
-   see that const; it falls back to the shared registry, which is safe there
-   because a second unoptimized Sol bundle cannot load into the same realm
-   (its goog namespaces are global and already declared)."
+   see that const; it falls back to the shared registry. If a release bundle
+   loaded earlier in the same realm, this fallback can return that bundle's
+   URL and anchor native-module lookup to its install. A second unoptimized
+   Sol bundle cannot load into the same realm at all (its goog namespaces are
+   global and already declared)."
   []
   (if (exists? js/open_hax$sol$module_url)
     js/open_hax$sol$module_url
