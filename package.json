@@ -22,7 +22,9 @@
     "test:guard": "node --test scripts/run-shadow-tests-ci.test.mjs scripts/contract-guard.test.mjs scripts/compile-clean.test.mjs",
     "check:startup": "node scripts/check-startup.mjs",
     "build:clio-native": "shadow-cljs compile clio-native",
-    "check:clio-native": "node scripts/check-clio-native.mjs"
+    "check:clio-native": "node scripts/check-clio-native.mjs",
+    "build:clio-native:release": "shadow-cljs release clio-native",
+    "check:clio-native:two-bundles": "node scripts/check-clio-native-two-bundles.mjs"
   },
   "dependencies": {
     "@fastify/cors": "^10.0.1",

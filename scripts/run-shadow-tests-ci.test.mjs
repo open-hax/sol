@@ -69,15 +69,35 @@ test('a signalled child fails even after passing counters', async () => {
 
 test('missing executable and timed out child fail', async () => {
   assert.notEqual((await runShadowTests({ command: '/sol-test-no-such-executable', args: [], stdout: quiet, stderr: quiet })).code, 0);
+  // The timed-out leader starts a descendant and reports its PID, so the
+  // timeout path must stop the whole compiler tree, not just the leader.
+  const leader = [
+    "const { spawn } = require('node:child_process');",
+    "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000);'], { stdio: 'ignore', detached: process.platform === 'win32' });",
+    "process.stdout.write('CHILD ' + child.pid + '\\n');",
+    'setInterval(() => {}, 1000);',
+  ].join(' ');
+  let captured = '';
   const result = await runShadowTests({
     command: process.execPath,
-    args: ['-e', 'setInterval(() => {}, 1000);'],
-    timeoutMs: 100,
-    stdout: quiet,
+    args: ['-e', leader],
+    // Long enough for a loaded worker to start the leader and report its
+    // descendant before the timeout path runs.
+    timeoutMs: 5_000,
+    stdout: (chunk) => { captured += chunk.toString(); },
     stderr: quiet,
   });
   assert.notEqual(result.code, 0);
   assert.equal(result.reason, 'timeout');
+  const descendant = Number(/CHILD (\d+)/.exec(captured)?.[1]);
+  assert.ok(descendant > 0, `timed-out leader did not report its descendant: ${captured}`);
+  let stopped = processStopped(descendant);
+  for (let i = 0; i < 50 && !stopped; i += 1) {
+    await new Promise((r) => setTimeout(r, 100));
+    stopped = processStopped(descendant);
+  }
+  if (!stopped) try { process.kill(descendant, 'SIGKILL'); } catch {}
+  assert.equal(stopped, true, `descendant ${descendant} survived the timeout`);
 });
 
 test('a descendant holding stdio open is reaped when the compiler exits', async () => {
@@ -130,15 +150,20 @@ test('a pipe holder outside the reaped tree fails instead of hanging', {
 // adopted children, and signal 0 still succeeds for a zombie. Treat that
 // state as stopped on Linux; elsewhere fall back to signal 0 alone.
 function processStopped(pid) {
-  try { process.kill(pid, 0); } catch { return true; }
+  // Only ESRCH proves the pid is gone; EPERM means it exists under another
+  // owner, so keep polling.
+  try { process.kill(pid, 0); } catch (error) { if (error.code === 'ESRCH') return true; }
   if (process.platform !== 'linux') return false;
   try {
     const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
     return stat.slice(stat.lastIndexOf(')') + 2).startsWith('Z');
   } catch (error) {
-    // ENOENT means the pid exited between the two checks. Any other read
-    // failure (procfs hidden or restricted) proves nothing, so keep polling.
-    return error.code === 'ENOENT';
+    // A missing procfs entry is not proof of exit (procfs may be unmounted),
+    // so on ENOENT repeat signal 0 and require ESRCH. Any other read failure
+    // proves nothing, so keep polling.
+    if (error.code !== 'ENOENT') return false;
+    try { process.kill(pid, 0); } catch (again) { return again.code === 'ESRCH'; }
+    return false;
   }
 }
 

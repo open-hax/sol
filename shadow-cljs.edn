@@ -10,7 +10,7 @@
    :output-dir "dist",
    :modules
    {:app
-     {:prepend "globalThis[Symbol.for(\"open-hax.sol/module-url\")] ??= import.meta.url;\n",
+     {:prepend "const open_hax$sol$module_url = import.meta.url;\nglobalThis[Symbol.for(\"open-hax.sol/module-url\")] ??= open_hax$sol$module_url;\n",
       :exports
       {:solPlugin open-hax.sol.plugin/sol-plugin,
        :config open-hax.sol.infra.config/config-js,
@@ -44,7 +44,7 @@
    :runtime :node,
    :output-dir "dist-dev",
    :modules {:server {:init-fn open-hax.sol.entrypoint/init
-                      :prepend "globalThis[Symbol.for(\"open-hax.sol/module-url\")] ??= import.meta.url;\n"}},
+                      :prepend "const open_hax$sol$module_url = import.meta.url;\nglobalThis[Symbol.for(\"open-hax.sol/module-url\")] ??= open_hax$sol$module_url;\n"}},
    :js-options
    {:js-provider :import,
     :keep-as-import
@@ -77,7 +77,7 @@
    :runtime :node,
    :output-dir "dist",
    :modules {:server {:init-fn open-hax.sol.entrypoint/init
-                      :prepend "globalThis[Symbol.for(\"open-hax.sol/module-url\")] ??= import.meta.url;\n"}},
+                      :prepend "const open_hax$sol$module_url = import.meta.url;\nglobalThis[Symbol.for(\"open-hax.sol/module-url\")] ??= open_hax$sol$module_url;\n"}},
    :js-options
    {:js-provider :import,
     :keep-as-import
@@ -102,13 +102,16 @@
   :clio-native
   {:target :esm
    :output-dir "target/clio-native"
-   :modules {:probe {:prepend "globalThis[Symbol.for(\"open-hax.sol/module-url\")] ??= import.meta.url;\n"
+   :modules {:probe {:prepend "const open_hax$sol$module_url = import.meta.url;\nglobalThis[Symbol.for(\"open-hax.sol/module-url\")] ??= open_hax$sol$module_url;\n"
                      :exports {:probe open-hax.sol.clio-native-probe/probe-edn!}}}
    :js-options {:js-provider :import
                 :keep-as-import #{"node:fs" "node:crypto" "node:path"
                                   "node:process" "node:module"}}
    :compiler-options {:output-feature-set :es-next :optimizations :none
-                      :infer-externs false}}
+                      :infer-externs false}
+   ;; Release output keeps each bundle's code module-scoped (two-bundle check).
+   :release {:output-dir "target/clio-native-release"
+             :compiler-options {:optimizations :simple}}}
   :test
    {:target :node-test,
     :output-to "target/test/test.cjs",
